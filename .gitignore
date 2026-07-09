@@ -1,15 +1,29 @@
-*.iml
+# Gradle
 .gradle
+gradle.properties.local
+
+# IDE
+*.iml
+/.idea/
+/.kotlin/
+
+# Local config
 /local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
+local.properties
+
+# Builds
 /build
 /captures
 .externalNativeBuild
 .cxx
-local.properties
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+nexa_vpn_log.txt
+
+# Debug notes
+debug-*.md

@@ -4,7 +4,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.widget.Toast
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -22,16 +21,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.focus.FocusRequester
-import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import kotlinx.coroutines.delay
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.PermissionManager
 
@@ -51,20 +46,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val errorMessage by viewModel.errorMessage.collectAsState()
 
     var showLogs by remember { mutableStateOf(false) }
-    var newNodeId by remember { mutableStateOf("") }
     var showPermissionGuide by remember { mutableStateOf(false) }
-    var expandedNode by remember { mutableStateOf<String?>(null) }
-    var newDomainForNode by remember { mutableStateOf<String?>(null) }
-    var focusTrigger by remember { mutableStateOf(0) }
-    val domainFocusRequester = remember { FocusRequester() }
+    var showAddNodeDialog by remember { mutableStateOf(false) }
+    var showAddDomainDialogForNode by remember { mutableStateOf<String?>(null) }
     var nodeToDelete by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(focusTrigger) {
-        if (focusTrigger > 0) {
-            delay(100)
-            domainFocusRequester.requestFocus()
-        }
-    }
 
     fun handleConnect(context: Context) {
         viewModel.checkVpnPermission(context)
@@ -250,35 +235,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         Icon(Icons.Default.Share, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Nodes & Domains", style = MaterialTheme.typography.titleSmall)
-                    }
-
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    Row(modifier = Modifier.fillMaxWidth()) {
-                        OutlinedTextField(
-                            value = newNodeId,
-                            onValueChange = { newNodeId = it },
-                            label = { Text("Add node ID") },
-                            modifier = Modifier.weight(1f).padding(end = 8.dp),
-                            singleLine = true
-                        )
-                        Button(
-                            onClick = {
-                                if (newNodeId.isNotEmpty()) {
-                                    val nodeId = newNodeId
-                                    viewModel.addNode(nodeId)
-                                    expandedNode = nodeId
-                                    newDomainForNode = "$nodeId:"
-                                    newNodeId = ""
-                                    focusTrigger++
-                                }
-                            },
-                            modifier = Modifier.align(Alignment.Bottom),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = MaterialTheme.colorScheme.primary
-                            )
+                        Spacer(modifier = Modifier.weight(1f))
+                        TextButton(
+                            onClick = { showAddNodeDialog = true }
                         ) {
-                            Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
+                            Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Add Node")
                         }
                     }
 
@@ -304,11 +267,11 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                             modifier = Modifier.fillMaxWidth()
                                         ) {
                                             Icon(
-                                                        Icons.Default.Share,
-                                                        contentDescription = null,
-                                                        tint = MaterialTheme.colorScheme.primary,
-                                                        modifier = Modifier.size(18.dp)
-                                                    )
+                                                Icons.Default.Share,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.size(18.dp)
+                                            )
                                             Spacer(modifier = Modifier.width(8.dp))
                                             Text(
                                                 node.nodeId,
@@ -332,61 +295,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                             }
                                         }
 
-                                        Spacer(modifier = Modifier.height(12.dp))
-
-                                        Row(modifier = Modifier.fillMaxWidth()) {
-                                            val isCurrentNode = expandedNode == node.nodeId
-                                            val domainValue = if (isCurrentNode) {
-                                                newDomainForNode?.takeIf { it.startsWith(node.nodeId + ":") }?.substringAfter(":") ?: ""
-                                            } else ""
-                                            OutlinedTextField(
-                                                value = domainValue,
-                                                onValueChange = { value ->
-                                                    expandedNode = node.nodeId
-                                                    newDomainForNode = "${node.nodeId}:$value"
-                                                },
-                                                label = { Text("Add domain") },
-                                                modifier = Modifier
-                                                    .weight(1f)
-                                                    .padding(end = 8.dp)
-                                                    .then(
-                                                        if (isCurrentNode) Modifier.focusRequester(domainFocusRequester)
-                                                        else Modifier
-                                                    )
-                                                    .onFocusChanged { focusState ->
-                                                        if (focusState.isFocused) {
-                                                            expandedNode = node.nodeId
-                                                        }
-                                                    },
-                                                singleLine = true
-                                            )
-                                            Button(
-                                                onClick = {
-                                                    val domain = if (expandedNode == node.nodeId) (newDomainForNode?.substringAfter(":") ?: "") else ""
-                                                    if (domain.isNotEmpty()) {
-                                                        viewModel.addDomainToNode(node.nodeId, domain)
-                                                        newDomainForNode = "${node.nodeId}:"
-                                                        expandedNode = node.nodeId
-                                                    }
-                                                },
-                                                modifier = Modifier.align(Alignment.Bottom),
-                                                colors = ButtonDefaults.buttonColors(
-                                                    containerColor = MaterialTheme.colorScheme.secondary
-                                                )
-                                            ) {
-                                                Icon(Icons.Default.Add, contentDescription = "Add", modifier = Modifier.size(18.dp))
-                                            }
-                                        }
-
-                                        Spacer(modifier = Modifier.height(12.dp))
-
                                         if (node.domains.isEmpty()) {
+                                            Spacer(modifier = Modifier.height(8.dp))
                                             Text(
                                                 text = "No domains added for this node.",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                         } else {
+                                            Spacer(modifier = Modifier.height(12.dp))
                                             node.domains.forEach { domain ->
                                                 Row(
                                                     verticalAlignment = Alignment.CenterVertically,
@@ -419,6 +336,26 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                                     }
                                                 }
                                             }
+                                        }
+
+                                        Spacer(modifier = Modifier.height(8.dp))
+
+                                        TextButton(
+                                            onClick = { showAddDomainDialogForNode = node.nodeId },
+                                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.Add,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(18.dp),
+                                                tint = MaterialTheme.colorScheme.secondary
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                "Add Domain",
+                                                style = MaterialTheme.typography.labelLarge,
+                                                color = MaterialTheme.colorScheme.secondary
+                                            )
                                         }
                                     }
                                 }
@@ -505,6 +442,25 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             }
         }
 
+        if (showAddNodeDialog) {
+            AddNodeDialog(
+                onDismiss = { showAddNodeDialog = false },
+                onAdd = { nodeId ->
+                    viewModel.addNode(nodeId)
+                }
+            )
+        }
+
+        showAddDomainDialogForNode?.let { nodeId ->
+            AddDomainDialog(
+                nodeId = nodeId,
+                onDismiss = { showAddDomainDialogForNode = null },
+                onAdd = { domain ->
+                    viewModel.addDomainToNode(nodeId, domain)
+                }
+            )
+        }
+
         nodeToDelete?.let { nodeId ->
             AlertDialog(
                 onDismissRequest = { nodeToDelete = null },
@@ -531,4 +487,92 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             )
         }
     }
+}
+
+@Composable
+private fun AddNodeDialog(
+    onDismiss: () -> Unit,
+    onAdd: (String) -> Unit
+) {
+    var nodeId by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add Node") },
+        text = {
+            OutlinedTextField(
+                value = nodeId,
+                onValueChange = { nodeId = it },
+                label = { Text("Node ID") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val id = nodeId.trim()
+                    if (id.isNotEmpty()) {
+                        onAdd(id)
+                        onDismiss()
+                    }
+                }
+            ) {
+                Text("Add")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
+private fun AddDomainDialog(
+    nodeId: String,
+    onDismiss: () -> Unit,
+    onAdd: (String) -> Unit
+) {
+    var domain by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Add Domain") },
+        text = {
+            Column {
+                Text(
+                    text = "Node: $nodeId",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 12.dp)
+                )
+                OutlinedTextField(
+                    value = domain,
+                    onValueChange = { domain = it },
+                    label = { Text("Domain") },
+                    placeholder = { Text("example.com") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val value = domain.trim()
+                    if (value.isNotEmpty()) {
+                        onAdd(value)
+                        onDismiss()
+                    }
+                }
+            ) {
+                Text("Add")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
 }

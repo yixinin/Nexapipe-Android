@@ -11,6 +11,7 @@ import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.vpn.NexaVpnService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 import kotlinx.serialization.Serializable
@@ -135,21 +136,37 @@ class VpnViewModel : ViewModel() {
                 }
 
                 addLog("Starting proxy...")
-                val port = proxyPort.value.toInt()
+                val basePort = proxyPort.value.toInt()
 
                 IrohProxy.nativeStopProxy()
-                addLog("Stopped any existing proxy")
+                addLog("Stopped any existing proxy, waiting for port release...")
+                delay(500)
 
-                val result = IrohProxy.nativeStartProxy(port)
-                if (result != 0) {
-                    throw Exception("Failed to start proxy")
+                var result = -1
+                var actualPort = basePort
+                for (attempt in 0..9) {
+                    actualPort = basePort + attempt
+                    addLog("Trying to start proxy on port $actualPort...")
+                    result = IrohProxy.nativeStartProxy(actualPort)
+                    if (result == 0) {
+                        break
+                    }
+                    addLog("Failed to start proxy on port $actualPort, retrying...")
+                    delay(200)
                 }
-                addLog("Proxy started on port $port")
+                if (result != 0) {
+                    throw Exception("Failed to start proxy on ports $basePort..${basePort + 9}")
+                }
+                addLog("Proxy started on port $actualPort")
+
+                if (actualPort != basePort) {
+                    proxyPort.value = actualPort.toString()
+                }
 
                 val allDomains = nodes.value.flatMap { it.domains }
                 val intent = Intent(context, NexaVpnService::class.java).apply {
                     action = NexaVpnService.ACTION_START
-                    putExtra(NexaVpnService.EXTRA_PROXY_PORT, port)
+                    putExtra(NexaVpnService.EXTRA_PROXY_PORT, actualPort)
                     putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(allDomains))
                 }
                 context.startForegroundService(intent)
