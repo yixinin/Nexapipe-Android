@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.Network
 import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
@@ -16,6 +17,11 @@ import com.nexa.pipe.MainActivity
 import com.nexa.pipe.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -48,14 +54,28 @@ class NexaVpnService : VpnService() {
         var serverAck: Long
     )
     private var nextVirtualIp = 1
-    private val VIRTUAL_IP_PREFIX = "100.64."
-    private val VIRTUAL_DNS_IP = "100.64.0.1"
+    private val VIRTUAL_IP_PREFIX = "10.0.1."
+    private val VIRTUAL_DNS_IP = "10.0.1.1"
     private var cachedDnsServers = listOf<String>()
+
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var reconnectJob: Job? = null
+    private var isUserStarted = false
+    private var isVpnEstablished = false
+    private var isReconnectPending = false
+    private var firstNetworkCallback = true
+    private var reconnectAttempts = 0
+    private val MAX_RECONNECT_ATTEMPTS = 10
 
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "VpnService created")
         createNotificationChannel()
+        connectivityManager = getSystemService(ConnectivityManager::class.java)
+        networkCallback = createNetworkCallback()
+        connectivityManager?.registerDefaultNetworkCallback(networkCallback!!)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -65,6 +85,8 @@ class NexaVpnService : VpnService() {
                     proxyPort = intent.getIntExtra(EXTRA_PROXY_PORT, 8080)
                     val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS)
                     domains?.let { allowedDomains.addAll(it) }
+                    reconnectAttempts = 0
+                    reconnectJob?.cancel()
                     cachedDnsServers = getSystemDnsServers()
                     Log.d(TAG, "Cached DNS servers before VPN: $cachedDnsServers")
                     startVpn()
@@ -77,7 +99,8 @@ class NexaVpnService : VpnService() {
         return START_STICKY
     }
 
-    private fun startVpn() {
+    private fun startVpn(isReconnect: Boolean = false) {
+        isUserStarted = true
         try {
             // Check if TUN device is available on the system
             val tunDevice = java.io.File("/dev/net/tun")
@@ -95,8 +118,8 @@ class NexaVpnService : VpnService() {
 
             val builder = Builder()
                 .setMtu(1280)
-                .addAddress("100.64.0.2", 24)
-                .addRoute("100.64.0.0", 10)
+                .addAddress("10.0.1.2", 24)
+                .addRoute("10.0.1.0", 24)
                 .addDnsServer(VIRTUAL_DNS_IP)
                 .setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", proxyPort))
 
@@ -106,37 +129,50 @@ class NexaVpnService : VpnService() {
 
             Log.d(TAG, "Attempting to establish VPN interface...")
             vpnInterface = builder.establish()
-            
+
             if (vpnInterface == null) {
                 Log.e(TAG, "Failed to establish VPN interface: builder.establish() returned null")
                 throw IllegalStateException("Failed to establish VPN interface - system may not support TUN devices")
             }
 
             Log.d(TAG, "VPN interface established successfully, starting foreground service...")
-            
+
             // Start foreground AFTER establishing VPN interface successfully
             isRunning = true
+            isVpnEstablished = true
+            isReconnectPending = false
+            reconnectAttempts = 0
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                 startForeground(NOTIFICATION_ID, createNotification(), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
             } else {
                 startForeground(NOTIFICATION_ID, createNotification())
             }
             Log.d(TAG, "Foreground service started, proxyPort: $proxyPort")
-            
+
             startPacketProcessing()
 
         } catch (e: SecurityException) {
             Log.e(TAG, "SecurityException starting VPN: ${e.message}", e)
-            cleanupAndStop()
+            handleStartFailure(isReconnect)
             throw e
         } catch (e: IllegalStateException) {
             Log.e(TAG, "VPN startup failed: ${e.message}", e)
-            cleanupAndStop()
+            handleStartFailure(isReconnect)
             throw e
         } catch (e: Exception) {
             Log.e(TAG, "Error starting VPN: ${e.message}", e)
-            cleanupAndStop()
+            handleStartFailure(isReconnect)
             throw e
+        }
+    }
+
+    private fun handleStartFailure(isReconnect: Boolean) {
+        isVpnEstablished = false
+        if (isReconnect) {
+            Log.w(TAG, "VPN reconnect attempt failed, will retry")
+            scheduleReconnect()
+        } else {
+            cleanupAndStop()
         }
     }
     
@@ -159,9 +195,15 @@ class NexaVpnService : VpnService() {
     }
 
     private fun stopVpn() {
+        isUserStarted = false
+        isVpnEstablished = false
+        isReconnectPending = false
+        reconnectAttempts = 0
+        reconnectJob?.cancel()
         isRunning = false
         vpnInterface?.close()
         vpnInterface = null
+        closeAllTcpConnections()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
@@ -170,6 +212,74 @@ class NexaVpnService : VpnService() {
         }
         stopSelf()
         Log.d(TAG, "VPN stopped")
+    }
+
+    private fun stopVpnInterfaceOnly() {
+        Log.d(TAG, "Stopping VPN interface only for reconnect")
+        isVpnEstablished = false
+        isRunning = false
+        vpnInterface?.close()
+        vpnInterface = null
+        closeAllTcpConnections()
+    }
+
+    private fun closeAllTcpConnections() {
+        val keys = tcpConnections.keys.toList()
+        for (key in keys) {
+            closeTcpConnection(key)
+        }
+        tcpConnections.clear()
+    }
+
+    private fun createNetworkCallback(): ConnectivityManager.NetworkCallback {
+        return object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                // The first callback fires immediately after registration with the current network;
+                // ignore it to avoid an unnecessary restart right after the user connects.
+                if (firstNetworkCallback) {
+                    firstNetworkCallback = false
+                    return
+                }
+                if (isUserStarted && isReconnectPending) {
+                    Log.d(TAG, "Network available, scheduling VPN reconnect on $network")
+                    scheduleReconnect()
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (!isUserStarted || !isVpnEstablished) return
+                Log.d(TAG, "Network lost, tearing down VPN interface for reconnect")
+                isReconnectPending = true
+                reconnectJob?.cancel()
+                serviceScope.launch(Dispatchers.IO) {
+                    stopVpnInterfaceOnly()
+                }
+            }
+        }
+    }
+
+    private fun scheduleReconnect() {
+        reconnectJob?.cancel()
+        reconnectJob = serviceScope.launch(Dispatchers.IO) {
+            if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                Log.e(TAG, "Max reconnect attempts reached, giving up")
+                stopVpn()
+                return@launch
+            }
+            val delayMs = (1500L * (1 shl reconnectAttempts)).coerceAtMost(30000L)
+            Log.d(TAG, "Scheduling VPN reconnect in ${delayMs}ms (attempt ${reconnectAttempts + 1}/$MAX_RECONNECT_ATTEMPTS)")
+            delay(delayMs)
+            if (!isActive || !isUserStarted || isVpnEstablished) {
+                return@launch
+            }
+            try {
+                reconnectAttempts++
+                cachedDnsServers = getSystemDnsServers()
+                startVpn(isReconnect = true)
+            } catch (e: Exception) {
+                Log.e(TAG, "Auto-reconnect failed: ${e.message}", e)
+            }
+        }
     }
 
     private fun startPacketProcessing() {
@@ -512,15 +622,11 @@ class NexaVpnService : VpnService() {
 
     private fun getVirtualIpForDomain(domain: String): String {
         return domainVirtualIpMap.getOrPut(domain) {
-            val thirdOctet = nextVirtualIp / 254
-            val fourthOctet = (nextVirtualIp % 254) + 1
             nextVirtualIp++
-            if (thirdOctet > 127) {
-                nextVirtualIp = 1
-                "${VIRTUAL_IP_PREFIX}0.1"
-            } else {
-                "${VIRTUAL_IP_PREFIX}$thirdOctet.$fourthOctet"
+            if (nextVirtualIp > 254) {
+                nextVirtualIp = 2
             }
+            "${VIRTUAL_IP_PREFIX}1.$nextVirtualIp"
         }
     }
 
@@ -909,12 +1015,19 @@ class NexaVpnService : VpnService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        reconnectJob?.cancel()
+        serviceScope.cancel()
+        try {
+            networkCallback?.let { connectivityManager?.unregisterNetworkCallback(it) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error unregistering network callback: ${e.message}")
+        }
         stopVpn()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        if (isRunning) {
+        if (isUserStarted) {
             Log.d(TAG, "Task removed, restarting VPN service")
             val restartIntent = Intent(this, NexaVpnService::class.java).apply {
                 action = ACTION_START
