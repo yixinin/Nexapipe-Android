@@ -8,7 +8,7 @@ object IrohProxy {
     
     init {
         try {
-            System.loadLibrary("nexa_iroh_proxy")
+            System.loadLibrary("nexapipe_client")
             nativeInit()
             nativeLoaded = true
             Log.d(TAG, "Native library loaded successfully")

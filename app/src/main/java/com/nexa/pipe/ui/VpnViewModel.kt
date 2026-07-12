@@ -98,7 +98,7 @@ class VpnViewModel : ViewModel() {
 
             try {
                 if (!IrohProxy.isNativeLoaded()) {
-                    throw Exception("Native library not loaded. Please check if libnexa_iroh_proxy.so is properly included in the APK.")
+                    throw Exception("Native library not loaded. Please check if libnexapipe_client.so is properly included in the APK.")
                 }
 
                 val vpnPermissionGranted = VpnService.prepare(context) == null
