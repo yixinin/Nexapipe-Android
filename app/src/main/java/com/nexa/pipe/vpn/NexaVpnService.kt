@@ -438,8 +438,10 @@ class NexaVpnService : VpnService() {
         val dstPort = ((packet[ipHeaderLength + 2].toInt() and 0xFF) shl 8) or
                 (packet[ipHeaderLength + 3].toInt() and 0xFF)
 
-        // 只处理到虚拟代理 IP 的 TCP 80 端口流量
-        if (dstIP != virtualProxyIP || dstPort != 80) return
+        if (dstIP != virtualProxyIP) return
+
+        // 处理到虚拟代理 IP 的 TCP 80 和 443 端口流量（HTTP 和 HTTPS）
+        if (dstPort != 80 && dstPort != 443) return
 
         val srcIP = extractIP(packet, 12)
         val srcPort = ((packet[ipHeaderLength].toInt() and 0xFF) shl 8) or
@@ -448,12 +450,12 @@ class NexaVpnService : VpnService() {
         val seqNum = readInt(packet, ipHeaderLength + 4)
         val ackNum = readInt(packet, ipHeaderLength + 8)
 
-        val connKey = "$srcIP:$srcPort"
+        val connKey = "$srcIP:$srcPort:$dstPort"
 
         when {
             // SYN (without ACK) — 三次握手第一步
             flags and 0x02 != 0 && flags and 0x10 == 0 -> {
-                Log.d(TAG, "TCP SYN from $srcIP:$srcPort")
+                Log.d(TAG, "TCP SYN from $srcIP:$srcPort to $dstIP:$dstPort")
                 handleTCPSYN(connKey, srcIP, srcPort, seqNum)
             }
             // ACK (可能包含 PSH) — 数据或握手确认
