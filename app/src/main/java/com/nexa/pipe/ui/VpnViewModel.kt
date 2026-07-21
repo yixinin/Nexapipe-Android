@@ -120,19 +120,23 @@ class VpnViewModel : ViewModel() {
 
                 IrohProxy.nativeClearNodes()
 
+                var hasDomainMappings = false
                 for (node in nodes.value) {
                     if (node.domains.isNotEmpty()) {
-                        val domainsStr = node.domains.joinToString(",")
-                        addLog("Adding node: ${node.nodeId} with domains: $domainsStr")
-                        val result = IrohProxy.nativeAddNode(node.nodeId, domainsStr)
-                        if (result != 0) {
-                            addLog("Failed to add node: ${node.nodeId}")
+                        for (domain in node.domains) {
+                            addLog("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId}")
+                            val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
+                            if (result != 0) {
+                                addLog("Failed to add domain mapping: $domain")
+                            } else {
+                                hasDomainMappings = true
+                            }
                         }
                     }
                 }
 
-                if (nodes.value.isEmpty()) {
-                    throw Exception("No nodes configured. Please add nodes with domains.")
+                if (!hasDomainMappings) {
+                    throw Exception("No domain mappings configured. Please add nodes with domains.")
                 }
 
                 addLog("Starting proxy...")

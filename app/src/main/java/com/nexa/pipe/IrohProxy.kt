@@ -34,6 +34,8 @@ object IrohProxy {
     
     external fun nativeAddNode(nodeId: String, domains: String): Int
     
+    external fun nativeAddDomainMapping(domain: String, nodeId: String): Int
+    
     external fun nativeRemoveNode(nodeId: String): Int
     
     external fun nativeClearNodes(): Int

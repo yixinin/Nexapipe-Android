@@ -45,6 +45,9 @@ class NexaVpnService : VpnService() {
     private var isUserStarted = false
     private var proxyReaderJobs = mutableListOf<kotlinx.coroutines.Job>()
 
+    // 递增的 IP Identification，避免内核分片时 ID 冲突导致数据损坏
+    private val ipIdCounter = java.util.concurrent.atomic.AtomicInteger(1)
+
     // TUN 子网配置
     private val virtualDNSIP = "10.0.1.2"
     private val tunInterfaceIP = "10.0.1.1"
@@ -68,7 +71,8 @@ class NexaVpnService : VpnService() {
         var clientSeq: Long,  // 客户端当前的序列号
         var serverSeq: Long,  // 服务端（我们）的序列号
         var clientAck: Long,  // 客户端期望收到的下一个序列号
-        var serverAck: Long   // 服务端期望收到的下一个序列号
+        var serverAck: Long,  // 服务端期望收到的下一个序列号
+        var readerJob: kotlinx.coroutines.Job? = null  // 关联的 reader job
     )
 
     // key = "clientIP:clientPort"
@@ -276,10 +280,14 @@ class NexaVpnService : VpnService() {
 
         Log.d(TAG, "DNS query for: $domain")
 
-        val response = if (domain.isNotEmpty() && shouldProxyDomain(domain)) {
-            // 返回虚拟代理 IP（10.0.1.3），浏览器会通过 TUN 连接到此地址
+        val shouldProxy = domain.isNotEmpty() && shouldProxyDomain(domain)
+        Log.d(TAG, "Domain '$domain' shouldProxy: $shouldProxy, allowedDomains: $allowedDomains")
+
+        val response = if (shouldProxy) {
+            Log.d(TAG, "Proxying domain '$domain' to virtual IP $virtualProxyIP")
             createDNSResponse(dnsPayload, virtualProxyIP)
         } else {
+            Log.d(TAG, "Querying real DNS for domain '$domain'")
             queryRealDNS(dnsPayload)
         }
 
@@ -480,8 +488,9 @@ class NexaVpnService : VpnService() {
     }
 
     private fun handleTCPSYN(connKey: String, clientIP: String, clientPort: Int, clientSeq: Long) {
-        // 如果已存在连接，先关闭
+        // 如果已存在连接，取消旧 reader 并关闭旧 socket，避免新旧 reader 竞争同一个 connKey
         tcpConnections.remove(connKey)?.let { old ->
+            old.readerJob?.cancel()
             try { old.proxySocket.close() } catch (_: Exception) {}
         }
 
@@ -521,56 +530,56 @@ class NexaVpnService : VpnService() {
 
             // 启动后台协程，读取代理 socket 数据并写入 TUN
             val readerJob = serviceScope.launch {
+                var localServerSeq = updatedConn.serverSeq
+                var localServerAck = updatedConn.serverAck
+                var hasReceivedData = false
                 try {
+                    // local proxy 收完数据后会主动关闭连接，这里只做兜底。
+                    // 60s 覆盖 iroh 初始连接建立和慢速中继的传输间隔。
+                    proxySocket.soTimeout = 60000
                     val buf = ByteArray(4096)
                     val inputStream = proxySocket.getInputStream()
                     while (isRunning && proxySocket.isConnected && !proxySocket.isClosed) {
                         val n = inputStream.read(buf)
                         if (n <= 0) break
 
+                        hasReceivedData = true
+
                         val data = buf.copyOf(n)
-                        // 记录代理响应前 200 字节的内容，便于调试
-                        if (data.size <= 200) {
-                            Log.d(TAG, "Proxy response: $n bytes for $connKey: ${data.decodeToString()}")
-                        } else {
-                            Log.d(TAG, "Proxy response: $n bytes for $connKey (first 200): ${data.copyOf(200).decodeToString()}")
-                        }
 
-                        // 获取当前连接状态（可能已经被关闭）
-                        val currentConn = tcpConnections[connKey] ?: break
-
-                        // 发送 TCP 数据包到客户端
                         sendTCPPacket(
                             srcIP = virtualProxyIP, srcPort = 80,
-                            dstIP = currentConn.clientIP, dstPort = currentConn.clientPort,
-                            seqNum = currentConn.serverSeq, ackNum = currentConn.serverAck,
+                            dstIP = clientIP, dstPort = clientPort,
+                            seqNum = localServerSeq, ackNum = localServerAck,
                             flags = 0x18,  // PSH + ACK
                             data = data
                         )
 
-                        // 更新服务端序列号
-                        val nextConn = currentConn.copy(serverSeq = currentConn.serverSeq + n)
-                        tcpConnections[connKey] = nextConn
+                        localServerSeq += n
+                        Log.d(TAG, "TCP packet sent: $n bytes for $connKey, seq=${localServerSeq - n}->$localServerSeq")
                     }
                 } catch (e: Exception) {
                     Log.d(TAG, "Proxy reader ended for $connKey: ${e.message}")
                 } finally {
-                    // 连接结束，发送 FIN
-                    val finalConn = tcpConnections[connKey]
-                    if (finalConn != null) {
+                    Log.d(TAG, "Sending FIN for $connKey, hasReceivedData=$hasReceivedData")
+                    // 只有当前 socket 仍然关联这个 connKey 时才清理，避免误删新连接
+                    val currentConn = tcpConnections[connKey]
+                    if (currentConn?.proxySocket === proxySocket) {
                         sendTCPPacket(
                             srcIP = virtualProxyIP, srcPort = 80,
-                            dstIP = finalConn.clientIP, dstPort = finalConn.clientPort,
-                            seqNum = finalConn.serverSeq, ackNum = finalConn.serverAck,
+                            dstIP = clientIP, dstPort = clientPort,
+                            seqNum = localServerSeq, ackNum = localServerAck,
                             flags = 0x11,  // FIN + ACK
                             data = null
                         )
+                        Log.d(TAG, "FIN sent for $connKey, seq=$localServerSeq")
+                        tcpConnections.remove(connKey)
                     }
-                    tcpConnections.remove(connKey)
                     try { proxySocket.close() } catch (_: Exception) {}
                 }
             }
             proxyReaderJobs.add(readerJob)
+            tcpConnections[connKey] = updatedConn.copy(readerJob = readerJob)
 
         } catch (e: Exception) {
             Log.d(TAG, "TCP SYN failed for $connKey: ${e.message}")
@@ -629,12 +638,14 @@ class NexaVpnService : VpnService() {
 
     private fun handleTCPFIN(connKey: String) {
         tcpConnections.remove(connKey)?.let { conn ->
+            conn.readerJob?.cancel()
             try { conn.proxySocket.close() } catch (_: Exception) {}
         }
     }
 
     private fun handleTCPRST(connKey: String) {
         tcpConnections.remove(connKey)?.let { conn ->
+            conn.readerJob?.cancel()
             try { conn.proxySocket.close() } catch (_: Exception) {}
         }
     }
@@ -662,8 +673,9 @@ class NexaVpnService : VpnService() {
         packet[1] = 0x00.toByte()
         packet[2] = ((ipTotalLen shr 8) and 0xFF).toByte()
         packet[3] = (ipTotalLen and 0xFF).toByte()
-        packet[4] = 0x00.toByte()
-        packet[5] = 0x00.toByte()
+        val ipId = ipIdCounter.getAndIncrement() and 0xFFFF
+        packet[4] = ((ipId shr 8) and 0xFF).toByte()
+        packet[5] = (ipId and 0xFF).toByte()
         packet[6] = 0x00.toByte()
         packet[7] = 0x00.toByte()
         packet[8] = 0x40.toByte()  // TTL
@@ -775,8 +787,9 @@ class NexaVpnService : VpnService() {
         packet[1] = 0x00.toByte()
         packet[2] = ((ipLength shr 8) and 0xFF).toByte()
         packet[3] = (ipLength and 0xFF).toByte()
-        packet[4] = 0x00.toByte()
-        packet[5] = 0x00.toByte()
+        val ipId = ipIdCounter.getAndIncrement() and 0xFFFF
+        packet[4] = ((ipId shr 8) and 0xFF).toByte()
+        packet[5] = (ipId and 0xFF).toByte()
         packet[6] = 0x00.toByte()
         packet[7] = 0x00.toByte()
         packet[8] = 0x40.toByte()
