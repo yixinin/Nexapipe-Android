@@ -11,8 +11,14 @@ import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.vpn.NexaVpnService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.withTimeout
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
 
 import kotlinx.serialization.Serializable
 
@@ -34,6 +40,7 @@ class VpnViewModel : ViewModel() {
     val proxyPort = kotlinx.coroutines.flow.MutableStateFlow("8080")
     val logMessages = kotlinx.coroutines.flow.MutableStateFlow(mutableListOf<String>())
     val errorMessage = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val connectionStatusText = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val vpnPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
     val notificationPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
 
@@ -95,6 +102,7 @@ class VpnViewModel : ViewModel() {
         viewModelScope.launch(Dispatchers.IO) {
             isConnecting.value = true
             errorMessage.value = null
+            connectionStatusText.value = null
 
             try {
                 if (!IrohProxy.isNativeLoaded()) {
@@ -167,7 +175,23 @@ class VpnViewModel : ViewModel() {
                     proxyPort.value = actualPort.toString()
                 }
 
+                // Pre-connect: warm up iroh connection via local proxy before starting VPN
                 val allDomains = nodes.value.flatMap { it.domains }
+
+                if (allDomains.isNotEmpty()) {
+                    connectionStatusText.value = "Pre-connecting..."
+                    addLog("Pre-connecting to ${allDomains.size} domains...")
+                    val preConnectedCount = preConnectAll(allDomains, actualPort)
+                    connectionStatusText.value = null
+                    addLog("Pre-connect completed: $preConnectedCount/${allDomains.size} domains succeeded")
+                    if (preConnectedCount > 0) {
+                        addLog("Pre-connect succeeded for at least one domain")
+                        delay(1000)
+                    } else {
+                        addLog("All pre-connect attempts failed, starting VPN anyway")
+                    }
+                }
+
                 val intent = Intent(context, NexaVpnService::class.java).apply {
                     action = NexaVpnService.ACTION_START
                     putExtra(NexaVpnService.EXTRA_PROXY_PORT, actualPort)
@@ -183,7 +207,69 @@ class VpnViewModel : ViewModel() {
                 addLog("Connection failed: ${e.message}")
             } finally {
                 isConnecting.value = false
+                connectionStatusText.value = null
             }
+        }
+    }
+
+    /**
+     * Send a lightweight HTTP GET request through the local proxy to warm up the iroh
+     * connection. Returns true if the backend responded (even with an error code),
+     * false on timeout or network failure.
+     */
+    private suspend fun preConnect(domain: String, proxyPort: Int, maxRetries: Int = 2): Boolean {
+        for (attempt in 0 until maxRetries) {
+            val success = try {
+                withTimeout(15_000) {
+                    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxyPort))
+                    val url = java.net.URL("http://$domain/")
+                    val conn = url.openConnection(proxy) as HttpURLConnection
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 10_000
+                    conn.requestMethod = "GET"
+                    conn.instanceFollowRedirects = false
+                    conn.responseCode
+                    true
+                }
+            } catch (e: Exception) {
+                if (attempt < maxRetries - 1) {
+                    Log.w(TAG, "Pre-connect to $domain attempt ${attempt + 1} failed: ${e.message}, retrying...")
+                    delay(500)
+                } else {
+                    Log.w(TAG, "Pre-connect to $domain failed after $maxRetries attempts: ${e.message}")
+                }
+                false
+            }
+            if (success) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * Pre-connect to all domains in parallel to warm up iroh connections.
+     * Returns the number of successfully pre-connected domains.
+     */
+    private suspend fun preConnectAll(domains: List<String>, proxyPort: Int): Int {
+        addLog("Starting parallel pre-connect for ${domains.size} domains")
+        connectionStatusText.value = "Pre-connecting..."
+        
+        return kotlinx.coroutines.coroutineScope {
+            val deferredResults = domains.map { domain ->
+                async {
+                    addLog("Pre-connecting to $domain")
+                    val success = preConnect(domain, proxyPort)
+                    if (success) {
+                        addLog("Pre-connect to $domain succeeded")
+                    } else {
+                        addLog("Pre-connect to $domain failed")
+                    }
+                    success
+                }
+            }
+            
+            deferredResults.awaitAll().count { it }
         }
     }
 

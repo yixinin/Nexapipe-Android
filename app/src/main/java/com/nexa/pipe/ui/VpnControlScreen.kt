@@ -44,6 +44,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val proxyPort by viewModel.proxyPort.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
+    val connectionStatusText by viewModel.connectionStatusText.collectAsState()
 
     var showLogs by remember { mutableStateOf(false) }
     var showPermissionGuide by remember { mutableStateOf(false) }
@@ -137,7 +138,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = if (isVpnRunning) "Connected" else if (isConnecting) "Connecting..." else "Disconnected",
+                            text = if (isVpnRunning) "Connected"
+                                else if (connectionStatusText != null) connectionStatusText!!
+                                else if (isConnecting) "Connecting..."
+                                else "Disconnected",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold,
                             color = if (isVpnRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface

@@ -68,6 +68,7 @@ class NexaVpnService : VpnService() {
         val proxyOutput: OutputStream,
         val clientIP: String,
         val clientPort: Int,
+        val dstPort: Int,
         var clientSeq: Long,  // 客户端当前的序列号
         var serverSeq: Long,  // 服务端（我们）的序列号
         var clientAck: Long,  // 客户端期望收到的下一个序列号
@@ -464,7 +465,7 @@ class NexaVpnService : VpnService() {
             // SYN (without ACK) — 三次握手第一步
             flags and 0x02 != 0 && flags and 0x10 == 0 -> {
                 Log.d(TAG, "TCP SYN from $srcIP:$srcPort to $dstIP:$dstPort")
-                handleTCPSYN(connKey, srcIP, srcPort, seqNum)
+                handleTCPSYN(connKey, srcIP, srcPort, dstPort, seqNum)
             }
             // ACK (可能包含 PSH) — 数据或握手确认
             flags and 0x10 != 0 -> {
@@ -487,7 +488,7 @@ class NexaVpnService : VpnService() {
         }
     }
 
-    private fun handleTCPSYN(connKey: String, clientIP: String, clientPort: Int, clientSeq: Long) {
+    private fun handleTCPSYN(connKey: String, clientIP: String, clientPort: Int, dstPort: Int, clientSeq: Long) {
         // 如果已存在连接，取消旧 reader 并关闭旧 socket，避免新旧 reader 竞争同一个 connKey
         tcpConnections.remove(connKey)?.let { old ->
             old.readerJob?.cancel()
@@ -498,7 +499,7 @@ class NexaVpnService : VpnService() {
             // 创建到本地代理的连接
             val proxySocket = Socket()
             proxySocket.connect(InetSocketAddress("127.0.0.1", proxyPort), 5000)
-            Log.d(TAG, "TCP SYN: connected to proxy 127.0.0.1:$proxyPort")
+            Log.d(TAG, "TCP SYN: connected to proxy 127.0.0.1:$proxyPort, dstPort=$dstPort")
 
             val serverSeq = Random.nextLong(1_000_000_000, 2_000_000_000)
 
@@ -507,6 +508,7 @@ class NexaVpnService : VpnService() {
                 proxyOutput = proxySocket.getOutputStream(),
                 clientIP = clientIP,
                 clientPort = clientPort,
+                dstPort = dstPort,
                 clientSeq = clientSeq + 1,  // 收到 SYN 后，期望的下一个序列号
                 serverSeq = serverSeq,
                 clientAck = serverSeq + 1,  // 我们期望客户端确认我们的 SYN
@@ -517,7 +519,7 @@ class NexaVpnService : VpnService() {
 
             // 发送 SYN-ACK
             sendTCPPacket(
-                srcIP = virtualProxyIP, srcPort = 80,
+                srcIP = virtualProxyIP, srcPort = dstPort,
                 dstIP = clientIP, dstPort = clientPort,
                 seqNum = serverSeq, ackNum = clientSeq + 1,
                 flags = 0x12,  // SYN + ACK
@@ -533,6 +535,7 @@ class NexaVpnService : VpnService() {
                 var localServerSeq = updatedConn.serverSeq
                 var localServerAck = updatedConn.serverAck
                 var hasReceivedData = false
+                var isWebSocket = false
                 try {
                     // local proxy 收完数据后会主动关闭连接，这里只做兜底。
                     // 60s 覆盖 iroh 初始连接建立和慢速中继的传输间隔。
@@ -547,28 +550,44 @@ class NexaVpnService : VpnService() {
 
                         val data = buf.copyOf(n)
 
+                        val isWsResponse = !isWebSocket && isWebSocketResponse(data)
+                        if (isWsResponse) {
+                            isWebSocket = true
+                            proxySocket.soTimeout = 300000
+                            Log.d(TAG, "WebSocket connection detected, timeout extended to 300s")
+                        }
+
+                        val modifiedData = if (isWebSocket) data else replaceConnectionHeader(data)
+
+                        val latestConn = tcpConnections[connKey]
+                        val ackNum = latestConn?.serverAck ?: localServerAck
                         sendTCPPacket(
-                            srcIP = virtualProxyIP, srcPort = 80,
+                            srcIP = virtualProxyIP, srcPort = dstPort,
                             dstIP = clientIP, dstPort = clientPort,
-                            seqNum = localServerSeq, ackNum = localServerAck,
+                            seqNum = localServerSeq, ackNum = ackNum,
                             flags = 0x18,  // PSH + ACK
-                            data = data
+                            data = modifiedData
                         )
 
                         localServerSeq += n
+                        tcpConnections[connKey]?.let { latest ->
+                            if (latest.proxySocket === proxySocket) {
+                                tcpConnections[connKey] = latest.copy(serverSeq = localServerSeq)
+                            }
+                        }
                         Log.d(TAG, "TCP packet sent: $n bytes for $connKey, seq=${localServerSeq - n}->$localServerSeq")
                     }
                 } catch (e: Exception) {
                     Log.d(TAG, "Proxy reader ended for $connKey: ${e.message}")
                 } finally {
-                    Log.d(TAG, "Sending FIN for $connKey, hasReceivedData=$hasReceivedData")
+                    Log.d(TAG, "Sending FIN for $connKey, hasReceivedData=$hasReceivedData, isWebSocket=$isWebSocket")
                     // 只有当前 socket 仍然关联这个 connKey 时才清理，避免误删新连接
                     val currentConn = tcpConnections[connKey]
-                    if (currentConn?.proxySocket === proxySocket) {
+                    if (currentConn != null && currentConn.proxySocket === proxySocket) {
                         sendTCPPacket(
-                            srcIP = virtualProxyIP, srcPort = 80,
+                            srcIP = virtualProxyIP, srcPort = dstPort,
                             dstIP = clientIP, dstPort = clientPort,
-                            seqNum = localServerSeq, ackNum = localServerAck,
+                            seqNum = localServerSeq, ackNum = currentConn.serverAck,
                             flags = 0x11,  // FIN + ACK
                             data = null
                         )
@@ -587,7 +606,7 @@ class NexaVpnService : VpnService() {
 
             // 发送 RST
             sendTCPPacket(
-                srcIP = virtualProxyIP, srcPort = 80,
+                srcIP = virtualProxyIP, srcPort = dstPort,
                 dstIP = clientIP, dstPort = clientPort,
                 seqNum = 0, ackNum = 0,
                 flags = 0x14,  // RST + ACK
@@ -601,6 +620,17 @@ class NexaVpnService : VpnService() {
         packet: ByteArray, ipHeaderLength: Int, tcpHeaderLen: Int, dataLen: Int
     ) {
         val conn = tcpConnections[connKey] ?: return
+
+        if (dataLen > 0 && seqNum < conn.clientSeq) {
+            sendTCPPacket(
+                srcIP = virtualProxyIP, srcPort = conn.dstPort,
+                dstIP = conn.clientIP, dstPort = conn.clientPort,
+                seqNum = conn.serverSeq, ackNum = conn.serverAck,
+                flags = 0x10,  // ACK
+                data = null
+            )
+            return
+        }
 
         // 更新 ACK 号（客户端期望我们发送的下一个序列号）
         val updatedConn = if (dataLen > 0) {
@@ -616,22 +646,41 @@ class NexaVpnService : VpnService() {
 
         if (dataLen > 0) {
             try {
-                // 提取 TCP 数据并写入代理 socket
                 val data = packet.copyOfRange(ipHeaderLength + tcpHeaderLen, packet.size)
                 updatedConn.proxyOutput.write(data)
                 updatedConn.proxyOutput.flush()
 
-                // 发送纯 ACK 确认收到浏览器的数据，避免浏览器重传
                 sendTCPPacket(
-                    srcIP = virtualProxyIP, srcPort = 80,
+                    srcIP = virtualProxyIP, srcPort = updatedConn.dstPort,
                     dstIP = updatedConn.clientIP, dstPort = updatedConn.clientPort,
                     seqNum = updatedConn.serverSeq, ackNum = updatedConn.serverAck,
                     flags = 0x10,  // ACK
                     data = null
                 )
             } catch (e: Exception) {
-                Log.d(TAG, "TCP data write failed for $connKey: ${e.message}")
-                handleTCPRST(connKey)
+                Log.d(TAG, "TCP data write failed for $connKey: ${e.message}, attempting reconnection")
+                val reconnected = tryReconnectProxy(connKey, updatedConn)
+                if (reconnected) {
+                    val newConn = tcpConnections[connKey] ?: return
+                    try {
+                        val data = packet.copyOfRange(ipHeaderLength + tcpHeaderLen, packet.size)
+                        newConn.proxyOutput.write(data)
+                        newConn.proxyOutput.flush()
+
+                        sendTCPPacket(
+                            srcIP = virtualProxyIP, srcPort = newConn.dstPort,
+                            dstIP = newConn.clientIP, dstPort = newConn.clientPort,
+                            seqNum = newConn.serverSeq, ackNum = newConn.serverAck,
+                            flags = 0x10,  // ACK
+                            data = null
+                        )
+                    } catch (re: Exception) {
+                        Log.d(TAG, "Reconnection write failed for $connKey: ${re.message}")
+                        handleTCPRST(connKey)
+                    }
+                } else {
+                    handleTCPRST(connKey)
+                }
             }
         }
     }
@@ -640,6 +689,96 @@ class NexaVpnService : VpnService() {
         tcpConnections.remove(connKey)?.let { conn ->
             conn.readerJob?.cancel()
             try { conn.proxySocket.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun tryReconnectProxy(connKey: String, oldConn: TcpConnection): Boolean {
+        try {
+            Log.d(TAG, "Attempting proxy reconnection for $connKey")
+            oldConn.readerJob?.cancel()
+            try { oldConn.proxySocket.close() } catch (_: Exception) {}
+
+            val newProxySocket = Socket()
+            newProxySocket.connect(InetSocketAddress("127.0.0.1", proxyPort), 5000)
+            Log.d(TAG, "Proxy reconnection successful for $connKey")
+
+            val newConn = TcpConnection(
+                proxySocket = newProxySocket,
+                proxyOutput = newProxySocket.getOutputStream(),
+                clientIP = oldConn.clientIP,
+                clientPort = oldConn.clientPort,
+                dstPort = oldConn.dstPort,
+                clientSeq = oldConn.clientSeq,
+                serverSeq = oldConn.serverSeq,
+                clientAck = oldConn.clientAck,
+                serverAck = oldConn.serverAck
+            )
+
+            val readerJob = serviceScope.launch {
+                var localServerSeq = newConn.serverSeq
+                var localServerAck = newConn.serverAck
+                var hasReceivedData = false
+                var isWebSocket = false
+                try {
+                    newProxySocket.soTimeout = 60000
+                    val buf = ByteArray(4096)
+                    val inputStream = newProxySocket.getInputStream()
+                    while (isRunning && newProxySocket.isConnected && !newProxySocket.isClosed) {
+                        val n = inputStream.read(buf)
+                        if (n <= 0) break
+
+                        hasReceivedData = true
+                        val data = buf.copyOf(n)
+
+                        if (!isWebSocket && isWebSocketResponse(data)) {
+                            isWebSocket = true
+                            newProxySocket.soTimeout = 300000
+                            Log.d(TAG, "WebSocket connection detected (reconnected), timeout extended to 300s")
+                        }
+
+                        val modifiedData = if (isWebSocket) data else replaceConnectionHeader(data)
+
+                        val latestConn = tcpConnections[connKey]
+                        val ackNum = latestConn?.serverAck ?: localServerAck
+                        sendTCPPacket(
+                            srcIP = virtualProxyIP, srcPort = newConn.dstPort,
+                            dstIP = newConn.clientIP, dstPort = newConn.clientPort,
+                            seqNum = localServerSeq, ackNum = ackNum,
+                            flags = 0x18,  // PSH + ACK
+                            data = modifiedData
+                        )
+
+                        localServerSeq += n
+                        tcpConnections[connKey]?.let { latest ->
+                            if (latest.proxySocket === newProxySocket) {
+                                tcpConnections[connKey] = latest.copy(serverSeq = localServerSeq)
+                            }
+                        }
+                        Log.d(TAG, "TCP packet sent (reconnected): $n bytes for $connKey")
+                    }
+                } catch (e: Exception) {
+                    Log.d(TAG, "Proxy reader ended (reconnected) for $connKey: ${e.message}")
+                } finally {
+                    val currentConn = tcpConnections[connKey]
+                    if (currentConn != null && currentConn.proxySocket === newProxySocket) {
+                        sendTCPPacket(
+                            srcIP = virtualProxyIP, srcPort = newConn.dstPort,
+                            dstIP = newConn.clientIP, dstPort = newConn.clientPort,
+                            seqNum = localServerSeq, ackNum = currentConn.serverAck,
+                            flags = 0x11,  // FIN + ACK
+                            data = null
+                        )
+                        tcpConnections.remove(connKey)
+                    }
+                    try { newProxySocket.close() } catch (_: Exception) {}
+                }
+            }
+            proxyReaderJobs.add(readerJob)
+            tcpConnections[connKey] = newConn.copy(readerJob = readerJob)
+            return true
+        } catch (e: Exception) {
+            Log.d(TAG, "Proxy reconnection failed for $connKey: ${e.message}")
+            return false
         }
     }
 
@@ -865,6 +1004,28 @@ class NexaVpnService : VpnService() {
             parts[2].toInt().toByte(),
             parts[3].toInt().toByte()
         )
+    }
+
+    private fun replaceConnectionHeader(data: ByteArray): ByteArray {
+        val keepAlive = "connection: keep-alive".toByteArray(Charsets.US_ASCII)
+        val close = "connection: close".toByteArray(Charsets.US_ASCII)
+        val dataStr = String(data, Charsets.US_ASCII).lowercase()
+
+        val index = dataStr.indexOf("connection: keep-alive")
+        if (index >= 0) {
+            val result = data.copyOf()
+            System.arraycopy(close, 0, result, index, close.size)
+            for (i in close.size until keepAlive.size) {
+                result[index + i] = ' '.code.toByte()
+            }
+            return result
+        }
+        return data
+    }
+
+    private fun isWebSocketResponse(data: ByteArray): Boolean {
+        val dataStr = String(data, Charsets.US_ASCII).lowercase()
+        return dataStr.contains("101 switching protocols")
     }
 
     // ============================================================
