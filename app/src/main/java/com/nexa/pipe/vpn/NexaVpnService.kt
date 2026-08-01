@@ -28,6 +28,8 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import kotlin.random.Random
 
 class NexaVpnService : VpnService() {
@@ -44,6 +46,7 @@ class NexaVpnService : VpnService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var isUserStarted = false
     private var proxyReaderJobs = mutableListOf<kotlinx.coroutines.Job>()
+    private var tunWriterExecutor: ExecutorService? = null
 
     // 递增的 IP Identification，避免内核分片时 ID 冲突导致数据损坏
     private val ipIdCounter = java.util.concurrent.atomic.AtomicInteger(1)
@@ -140,6 +143,9 @@ class NexaVpnService : VpnService() {
 
         vpnInterface?.close()
         vpnInterface = null
+
+        tunWriterExecutor?.shutdown()
+        tunWriterExecutor = null
 
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
@@ -250,13 +256,28 @@ class NexaVpnService : VpnService() {
         }
     }
 
-    @Synchronized
     private fun writeToTun(data: ByteArray) {
+        val writer = tunWriterExecutor ?: createTunWriterExecutor()
         try {
-            tunOutputStream?.write(data)
-            tunOutputStream?.flush()
+            writer.execute {
+                try {
+                    tunOutputStream?.write(data)
+                    tunOutputStream?.flush()
+                } catch (e: Exception) {
+                    Log.d(TAG, "Error writing to TUN: ${e.message}")
+                }
+            }
         } catch (e: Exception) {
-            Log.d(TAG, "Error writing to TUN: ${e.message}")
+            Log.d(TAG, "Error scheduling TUN write: ${e.message}")
+        }
+    }
+
+    private fun createTunWriterExecutor(): ExecutorService {
+        tunWriterExecutor?.let { return it }
+        return synchronized(this) {
+            tunWriterExecutor ?: Executors.newSingleThreadExecutor { r ->
+                Thread(r, "nexa-tun-writer").apply { isDaemon = true }
+            }.also { tunWriterExecutor = it }
         }
     }
 
@@ -622,10 +643,12 @@ class NexaVpnService : VpnService() {
         val conn = tcpConnections[connKey] ?: return
 
         if (dataLen > 0 && seqNum < conn.clientSeq) {
+            val latestConn = tcpConnections[connKey]
             sendTCPPacket(
                 srcIP = virtualProxyIP, srcPort = conn.dstPort,
                 dstIP = conn.clientIP, dstPort = conn.clientPort,
-                seqNum = conn.serverSeq, ackNum = conn.serverAck,
+                seqNum = latestConn?.clientAck ?: conn.clientAck,
+                ackNum = latestConn?.serverAck ?: conn.serverAck,
                 flags = 0x10,  // ACK
                 data = null
             )
@@ -647,16 +670,15 @@ class NexaVpnService : VpnService() {
         if (dataLen > 0) {
             try {
                 val data = packet.copyOfRange(ipHeaderLength + tcpHeaderLen, packet.size)
-                updatedConn.proxyOutput.write(data)
-                updatedConn.proxyOutput.flush()
-
                 sendTCPPacket(
                     srcIP = virtualProxyIP, srcPort = updatedConn.dstPort,
                     dstIP = updatedConn.clientIP, dstPort = updatedConn.clientPort,
-                    seqNum = updatedConn.serverSeq, ackNum = updatedConn.serverAck,
+                    seqNum = updatedConn.clientAck, ackNum = updatedConn.serverAck,
                     flags = 0x10,  // ACK
                     data = null
                 )
+                updatedConn.proxyOutput.write(data)
+                updatedConn.proxyOutput.flush()
             } catch (e: Exception) {
                 Log.d(TAG, "TCP data write failed for $connKey: ${e.message}, attempting reconnection")
                 val reconnected = tryReconnectProxy(connKey, updatedConn)
@@ -670,7 +692,7 @@ class NexaVpnService : VpnService() {
                         sendTCPPacket(
                             srcIP = virtualProxyIP, srcPort = newConn.dstPort,
                             dstIP = newConn.clientIP, dstPort = newConn.clientPort,
-                            seqNum = newConn.serverSeq, ackNum = newConn.serverAck,
+                            seqNum = newConn.clientAck, ackNum = newConn.serverAck,
                             flags = 0x10,  // ACK
                             data = null
                         )

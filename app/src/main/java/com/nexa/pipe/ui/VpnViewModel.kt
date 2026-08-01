@@ -11,11 +11,16 @@ import com.nexa.pipe.PermissionManager
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.vpn.NexaVpnService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
 import java.net.InetSocketAddress
 import java.net.Proxy
@@ -43,6 +48,19 @@ class VpnViewModel : ViewModel() {
     val connectionStatusText = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val vpnPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
     val notificationPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    // 串行化 connect/disconnect，避免并发 native 调用竞态。
+    private val connectionMutex = Mutex()
+    // 持有 connect 协程句柄，disconnect 时可取消（JNI 不可中断，但下一挂起点会抛 CancellationException）。
+    private var connectJob: Job? = null
+
+    companion object {
+        // 单次连接尝试的超时与重试参数。弱网下 iroh bind 可达 30s，留足预算。
+        private const val MAX_CONNECT_ATTEMPTS = 3
+        private const val ATTEMPT_TIMEOUT_MS = 60_000L
+        private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
+        private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
+    }
 
     fun initSettings(context: android.content.Context) {
         if (settingsManager == null) {
@@ -80,15 +98,7 @@ class VpnViewModel : ViewModel() {
     fun startIroh() {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                addLog("Starting iroh...")
-                val id = IrohProxy.nativeStartIroh()
-                if (id != null) {
-                    endpointId.value = id
-                    isIrohStarted.value = true
-                    addLog("Iroh started: $id")
-                } else {
-                    addLog("Failed to start iroh")
-                }
+                ensureIrohStarted()
             } catch (e: Exception) {
                 addLog("Error starting iroh: ${e.message}")
                 errorMessage.value = e.message ?: "Unknown error"
@@ -96,118 +106,182 @@ class VpnViewModel : ViewModel() {
         }
     }
 
+    /**
+     * 启动 iroh endpoint（若未启动）。nativeStartIroh 在 Rust 侧已有 30s 超时。
+     * 抛异常表示失败，由调用方决定是否重试。
+     */
+    private suspend fun ensureIrohStarted() {
+        if (isIrohStarted.value) return
+        addLog("Starting iroh first...")
+        val id = IrohProxy.nativeStartIroh()
+        if (id != null) {
+            endpointId.value = id
+            isIrohStarted.value = true
+            addLog("Iroh started: $id")
+        } else {
+            throw Exception("Failed to start iroh")
+        }
+    }
+
+    /**
+     * 清空并重新添加 domain→node 映射。返回所有需代理的 domain 列表；
+     * 若无任何映射则抛异常。
+     */
+    private suspend fun addDomainMappings(): List<String> {
+        IrohProxy.nativeClearNodes()
+        var hasDomainMappings = false
+        for (node in nodes.value) {
+            if (node.domains.isNotEmpty()) {
+                for (domain in node.domains) {
+                    addLog("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId}")
+                    val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
+                    if (result != 0) {
+                        addLog("Failed to add domain mapping: $domain")
+                    } else {
+                        hasDomainMappings = true
+                    }
+                }
+            }
+        }
+        if (!hasDomainMappings) {
+            throw Exception("No domain mappings configured. Please add nodes with domains.")
+        }
+        return nodes.value.flatMap { it.domains }
+    }
+
+    /**
+     * 启动本地代理。先 nativeStopProxy（Rust 侧确定式回收监听端口，无需 delay），
+     * 再按端口递增重试最多 10 次。返回实际监听端口。
+     */
+    private suspend fun startProxyWithRetries(basePort: Int): Int {
+        addLog("Starting proxy...")
+        IrohProxy.nativeStopProxy()
+        var result = -1
+        var actualPort = basePort
+        for (attempt in 0..9) {
+            actualPort = basePort + attempt
+            addLog("Trying to start proxy on port $actualPort...")
+            result = IrohProxy.nativeStartProxy(actualPort)
+            if (result == 0) break
+            addLog("Failed to start proxy on port $actualPort, retrying...")
+            delay(200)
+        }
+        if (result != 0) {
+            throw Exception("Failed to start proxy on ports $basePort..${basePort + 9}")
+        }
+        addLog("Proxy started on port $actualPort")
+        if (actualPort != basePort) {
+            proxyPort.value = actualPort.toString()
+        }
+        return actualPort
+    }
+
+    /**
+     * 全量释放隧道资源：nativeDestroy（停本地代理 + 释放 iroh endpoint）+ 复位状态 + 停 VPN 服务。
+     * 关键点：复位 isIrohStarted=false，且 nativeDestroy 清掉 endpoint，使下次 connect
+     * 重新执行 nativeStartIroh 建立全新隧道，而非复用旧 endpoint。
+     * 注意：这里用 nativeDestroy 而非 nativeStopProxy——后者只停代理、保留 endpoint，
+     * 供 startProxyWithRetries 重绑端口时使用。
+     */
+    private suspend fun releaseAllResources(context: Context) {
+        try {
+            IrohProxy.nativeDestroy()
+        } catch (e: Exception) {
+            addLog("releaseAllResources: nativeDestroy failed: ${e.message}")
+        }
+        isIrohStarted.value = false
+        endpointId.value = ""
+        try {
+            val intent = Intent(context, NexaVpnService::class.java).apply {
+                action = NexaVpnService.ACTION_STOP
+            }
+            context.startService(intent)
+        } catch (_: Exception) {}
+        isVpnRunning.value = false
+    }
+
     fun connect(context: Context) {
         if (isConnecting.value) return
-
-        viewModelScope.launch(Dispatchers.IO) {
-            isConnecting.value = true
-            errorMessage.value = null
-            connectionStatusText.value = null
-
+        connectJob = viewModelScope.launch(Dispatchers.IO) {
+            // 与 disconnect 互斥；若 disconnect 正在进行则放弃本次连接。
+            if (!connectionMutex.tryLock()) {
+                addLog("connect: disconnect in progress, aborting")
+                return@launch
+            }
             try {
+                isConnecting.value = true
+                errorMessage.value = null
+                connectionStatusText.value = null
+
                 if (!IrohProxy.isNativeLoaded()) {
                     throw Exception("Native library not loaded. Please check if libnexapipe_client.so is properly included in the APK.")
                 }
-
                 val vpnPermissionGranted = VpnService.prepare(context) == null
                 if (!vpnPermissionGranted) {
                     throw Exception("VPN permission not granted. Please grant VPN permission first.")
                 }
 
-                if (!isIrohStarted.value) {
-                    addLog("Starting iroh first...")
-                    val id = IrohProxy.nativeStartIroh()
-                    if (id != null) {
-                        endpointId.value = id
-                        isIrohStarted.value = true
-                        addLog("Iroh started: $id")
-                    } else {
-                        throw Exception("Failed to start iroh")
-                    }
-                }
-
-                IrohProxy.nativeClearNodes()
-
-                var hasDomainMappings = false
-                for (node in nodes.value) {
-                    if (node.domains.isNotEmpty()) {
-                        for (domain in node.domains) {
-                            addLog("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId}")
-                            val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
-                            if (result != 0) {
-                                addLog("Failed to add domain mapping: $domain")
-                            } else {
-                                hasDomainMappings = true
-                            }
-                        }
-                    }
-                }
-
-                if (!hasDomainMappings) {
-                    throw Exception("No domain mappings configured. Please add nodes with domains.")
-                }
-
-                addLog("Starting proxy...")
                 val basePort = proxyPort.value.toInt()
+                var lastError: Exception? = null
 
-                IrohProxy.nativeStopProxy()
-                addLog("Stopped any existing proxy, waiting for port release...")
-                delay(500)
+                // 重试循环：每次尝试整体超时 ATTEMPT_TIMEOUT_MS；超时/失败后全量释放资源再重试。
+                for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
+                    try {
+                        val actualPort = withTimeout(ATTEMPT_TIMEOUT_MS) {
+                            ensureIrohStarted()
+                            val allDomains = addDomainMappings()
+                            val port = startProxyWithRetries(basePort)
 
-                var result = -1
-                var actualPort = basePort
-                for (attempt in 0..9) {
-                    actualPort = basePort + attempt
-                    addLog("Trying to start proxy on port $actualPort...")
-                    result = IrohProxy.nativeStartProxy(actualPort)
-                    if (result == 0) {
-                        break
+                            // Pre-connect：通过本地代理预热 iroh 连接。
+                            connectionStatusText.value = "Pre-connecting..."
+                            addLog("Pre-connecting to ${allDomains.size} domains...")
+                            val preConnectedCount = preConnectAll(allDomains, port)
+                            connectionStatusText.value = null
+                            addLog("Pre-connect completed: $preConnectedCount/${allDomains.size} domains succeeded")
+                            if (preConnectedCount > 0) {
+                                addLog("Pre-connect succeeded for at least one domain")
+                                delay(1000)
+                            } else {
+                                addLog("All pre-connect attempts failed, starting VPN anyway")
+                            }
+                            port
+                        }
+
+                        // 成功：拉起 VPN 前台服务。
+                        val allDomains = nodes.value.flatMap { it.domains }
+                        val intent = Intent(context, NexaVpnService::class.java).apply {
+                            action = NexaVpnService.ACTION_START
+                            putExtra(NexaVpnService.EXTRA_PROXY_PORT, actualPort)
+                            putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(allDomains))
+                        }
+                        context.startForegroundService(intent)
+                        isVpnRunning.value = true
+                        addLog("VPN connected successfully (attempt $attempt/$MAX_CONNECT_ATTEMPTS)")
+                        return@launch
+                    } catch (e: TimeoutCancellationException) {
+                        // withTimeout 超时：可重试。
+                        addLog("Attempt $attempt/$MAX_CONNECT_ATTEMPTS timed out after ${ATTEMPT_TIMEOUT_MS}ms")
+                        lastError = e
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // disconnect 主动取消：不重试，向上传播以退出循环。
+                        throw e
+                    } catch (e: Exception) {
+                        addLog("Attempt $attempt/$MAX_CONNECT_ATTEMPTS failed: ${e.message}")
+                        lastError = e
                     }
-                    addLog("Failed to start proxy on port $actualPort, retrying...")
-                    delay(200)
-                }
-                if (result != 0) {
-                    throw Exception("Failed to start proxy on ports $basePort..${basePort + 9}")
-                }
-                addLog("Proxy started on port $actualPort")
 
-                if (actualPort != basePort) {
-                    proxyPort.value = actualPort.toString()
-                }
-
-                // Pre-connect: warm up iroh connection via local proxy before starting VPN
-                val allDomains = nodes.value.flatMap { it.domains }
-
-                if (allDomains.isNotEmpty()) {
-                    connectionStatusText.value = "Pre-connecting..."
-                    addLog("Pre-connecting to ${allDomains.size} domains...")
-                    val preConnectedCount = preConnectAll(allDomains, actualPort)
-                    connectionStatusText.value = null
-                    addLog("Pre-connect completed: $preConnectedCount/${allDomains.size} domains succeeded")
-                    if (preConnectedCount > 0) {
-                        addLog("Pre-connect succeeded for at least one domain")
-                        delay(1000)
-                    } else {
-                        addLog("All pre-connect attempts failed, starting VPN anyway")
+                    if (attempt < MAX_CONNECT_ATTEMPTS) {
+                        addLog("Releasing all resources before retry...")
+                        releaseAllResources(context)
+                        delay(BACKOFF_MS[attempt])
                     }
                 }
-
-                val intent = Intent(context, NexaVpnService::class.java).apply {
-                    action = NexaVpnService.ACTION_START
-                    putExtra(NexaVpnService.EXTRA_PROXY_PORT, actualPort)
-                    putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(allDomains))
-                }
-                context.startForegroundService(intent)
-                isVpnRunning.value = true
-                addLog("VPN connected successfully")
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Connection failed", e)
-                errorMessage.value = e.message ?: "Unknown error"
-                addLog("Connection failed: ${e.message}")
+                errorMessage.value = lastError?.message ?: "All connection attempts failed"
+                addLog("All $MAX_CONNECT_ATTEMPTS attempts failed")
             } finally {
                 isConnecting.value = false
                 connectionStatusText.value = null
+                connectionMutex.unlock()
             }
         }
     }
@@ -217,15 +291,15 @@ class VpnViewModel : ViewModel() {
      * connection. Returns true if the backend responded (even with an error code),
      * false on timeout or network failure.
      */
-    private suspend fun preConnect(domain: String, proxyPort: Int, maxRetries: Int = 2): Boolean {
+    private suspend fun preConnect(domain: String, proxyPort: Int, maxRetries: Int = 1): Boolean {
         for (attempt in 0 until maxRetries) {
             val success = try {
-                withTimeout(15_000) {
+                withTimeout(6_000) {
                     val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxyPort))
                     val url = java.net.URL("http://$domain/")
                     val conn = url.openConnection(proxy) as HttpURLConnection
-                    conn.connectTimeout = 10_000
-                    conn.readTimeout = 10_000
+                    conn.connectTimeout = 5_000
+                    conn.readTimeout = 5_000
                     conn.requestMethod = "GET"
                     conn.instanceFollowRedirects = false
                     conn.responseCode
@@ -250,11 +324,11 @@ class VpnViewModel : ViewModel() {
     /**
      * Pre-connect to all domains in parallel to warm up iroh connections.
      * Returns the number of successfully pre-connected domains.
+     * 注意：connectionStatusText 由 connect() 统一设置，此处不再重复赋值。
      */
     private suspend fun preConnectAll(domains: List<String>, proxyPort: Int): Int {
         addLog("Starting parallel pre-connect for ${domains.size} domains")
-        connectionStatusText.value = "Pre-connecting..."
-        
+
         return kotlinx.coroutines.coroutineScope {
             val deferredResults = domains.map { domain ->
                 async {
@@ -268,25 +342,28 @@ class VpnViewModel : ViewModel() {
                     success
                 }
             }
-            
+
             deferredResults.awaitAll().count { it }
         }
     }
 
     fun disconnect(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val intent = Intent(context, NexaVpnService::class.java).apply {
-                    action = NexaVpnService.ACTION_STOP
+            // 取消进行中的 connect：JNI 不可中断，但会在下一挂起点抛 CancellationException 退出。
+            connectJob?.cancel()
+
+            // 等待 connect 释放互斥锁（其 finally 会 unlock）。预算略大于单次连接超时。
+            val locked = withTimeoutOrNull(DISCONNECT_MUTEX_TIMEOUT_MS) {
+                connectionMutex.withLock {
+                    releaseAllResources(context)
                 }
-                context.startService(intent)
-                IrohProxy.nativeStopProxy()
-                isVpnRunning.value = false
-                addLog("VPN disconnected")
-            } catch (e: Exception) {
-                errorMessage.value = e.message ?: "Unknown error"
-                addLog("Disconnection failed: ${e.message}")
             }
+            if (locked == null) {
+                // 极端情况：connect 仍卡在 JNI 超过预算。Rust 侧已无死锁，直接强制释放。
+                addLog("disconnect: could not acquire mutex within ${DISCONNECT_MUTEX_TIMEOUT_MS}ms, forcing release")
+                releaseAllResources(context)
+            }
+            addLog("VPN disconnected")
         }
     }
 
