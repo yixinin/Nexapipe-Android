@@ -2,6 +2,8 @@ package com.nexa.pipe.ui
 
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -22,6 +24,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 
@@ -121,6 +124,98 @@ class VpnViewModel : ViewModel() {
         } else {
             throw Exception("Failed to start iroh")
         }
+    }
+
+    /**
+     * 从 ConnectivityManager 获取系统 DNS 服务器列表（逗号分隔的 IP 字符串）。
+     *
+     * iroh 默认在 Android 上通过 JNI 读取系统 DNS 会失败（Null pointer in call_method
+     * obj argument），回落到 Google DNS（8.8.8.8/8.8.4.4），国内不稳定导致后端连不上。
+     * 这里由 Kotlin 直接从 ConnectivityManager.getLinkProperties().dnsServers 获取系统 DNS，
+     * 传给 Rust 侧 nativeSetDnsServers，让 iroh 用自定义 DnsResolver 而非 JNI 路径。
+     *
+     * 跳过 TRANSPORT_VPN 网络，只取底层 WiFi/蜂窝网络的 DNS。若系统 DNS 为空（极端情况），
+     * 回落到国内常用公共 DNS（AliDNS 223.5.5.5、114DNS 114.114.114.114）。
+     */
+    private fun getSystemDnsServers(context: Context): String {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            ?: return ""
+        val servers = linkedSetOf<String>()
+
+        // 遍历所有网络，跳过 VPN 自身，只取底层 WiFi/蜂窝网络的 DNS
+        @Suppress("DEPRECATION")
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val lp = cm.getLinkProperties(network) ?: continue
+            lp.dnsServers.forEach { addr ->
+                addr.hostAddress?.let { servers.add(it) }
+            }
+        }
+
+        // 兜底：若底层网络 DNS 为空，试 activeNetwork（可能含 VPN，但好过没有）
+        if (servers.isEmpty()) {
+            cm.activeNetwork?.let { netId ->
+                cm.getLinkProperties(netId)?.dnsServers?.forEach { addr ->
+                    addr.hostAddress?.let { servers.add(it) }
+                }
+            }
+        }
+
+        // 最终兜底：国内常用公共 DNS。小米 17 在国内使用，AliDNS + 114DNS 覆盖主流场景。
+        if (servers.isEmpty()) {
+            addLog("No system DNS found, falling back to public DNS (223.5.5.5, 114.114.114.114)")
+            servers.add("223.5.5.5")
+            servers.add("114.114.114.114")
+        }
+
+        return servers.joinToString(",")
+    }
+
+    /**
+     * 预解析 iroh 基础设施域名的 IP，注入 Rust 侧 OverrideResolver。
+     *
+     * GFW 会丢弃 iroh.link 域名的 UDP DNS 响应，导致 iroh 内部 hickory 解析
+     * dns.iroh.link / *.relay.n0.iroh.link 超时。这里用系统 DNS（InetAddress，
+     * 可能走 DoT/Private DNS 绕过 GFW）预解析这些域名的 IP，构造
+     * "domain=ip1,ip2;domain2=ip3" 格式返回，供 connect() 传给 nativeSetDnsOverride。
+     * OverrideResolver 对这些域名直接返回预解析 IP，使 pkarr resolve（HTTPS to
+     * dns.iroh.link/pkarr/<z32>）和 relay 连接能成功。
+     */
+    private suspend fun resolveIrohDnsOverrides(): String {
+        // iroh presets::N0 使用的 DNS origin + 默认 relay 服务器。
+        val domains = listOf(
+            "dns.iroh.link",
+            "use1-1.relay.n0.iroh.link",
+            "usw1-1.relay.n0.iroh.link",
+            "euc1-1.relay.n0.iroh.link",
+            "aps1-1.relay.n0.iroh.link",
+        )
+
+        val overrides = kotlinx.coroutines.coroutineScope {
+            domains.map { domain ->
+                async(Dispatchers.IO) {
+                    try {
+                        val addrs = InetAddress.getAllByName(domain)
+                        val ips = addrs.mapNotNull { it.hostAddress }
+                        if (ips.isNotEmpty()) {
+                            addLog("Resolved iroh domain $domain -> $ips")
+                            "$domain=${ips.joinToString(",")}"
+                        } else {
+                            addLog("Failed to resolve iroh domain $domain (no IPs)")
+                            null
+                        }
+                    } catch (e: Exception) {
+                        addLog("Failed to resolve iroh domain $domain: ${e.message}")
+                        null
+                    }
+                }
+            }.awaitAll()
+        }
+
+        val result = overrides.filterNotNull().joinToString(";")
+        addLog("iroh DNS overrides: $result")
+        return result
     }
 
     /**
@@ -228,6 +323,20 @@ class VpnViewModel : ViewModel() {
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
                         val actualPort = withTimeout(ATTEMPT_TIMEOUT_MS) {
+                            // 注入系统 DNS 给 iroh，避免 iroh 在 Android 上 JNI 读系统 DNS
+                            // 失败后回落 Google DNS（国内不稳定导致后端连不上）。
+                            // 每次重试都重新获取，因为 releaseAllResources 后网络可能变化。
+                            val dnsServers = getSystemDnsServers(context)
+                            if (dnsServers.isNotEmpty()) {
+                                addLog("Injecting system DNS servers: $dnsServers")
+                                IrohProxy.nativeSetDnsServers(dnsServers)
+                            }
+                            // 预解析 iroh 基础设施域名（dns.iroh.link + relay），
+                            // 绕过 GFW 对 iroh.link UDP DNS 响应的阻断。每次重试都重新解析。
+                            val dnsOverrides = resolveIrohDnsOverrides()
+                            if (dnsOverrides.isNotEmpty()) {
+                                IrohProxy.nativeSetDnsOverride(dnsOverrides)
+                            }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()
                             val port = startProxyWithRetries(basePort)
