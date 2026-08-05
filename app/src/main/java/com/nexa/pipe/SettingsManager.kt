@@ -13,7 +13,6 @@ class SettingsManager(context: Context) {
 
     private companion object {
         const val KEY_NODES = "nodes"
-        const val KEY_PROXY_PORT = "proxy_port"
     }
 
     fun saveNodes(nodes: List<NodeConfig>) {
@@ -31,13 +30,5 @@ class SettingsManager(context: Context) {
         } catch (e: Exception) {
             emptyList()
         }
-    }
-
-    fun saveProxyPort(port: String) {
-        prefs.edit().putString(KEY_PROXY_PORT, port).apply()
-    }
-
-    fun loadProxyPort(): String {
-        return prefs.getString(KEY_PROXY_PORT, "8080") ?: "8080"
     }
 }

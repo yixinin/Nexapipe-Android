@@ -45,7 +45,6 @@ class VpnViewModel : ViewModel() {
     val isConnecting = kotlinx.coroutines.flow.MutableStateFlow(false)
     val endpointId = kotlinx.coroutines.flow.MutableStateFlow("")
     val nodes = kotlinx.coroutines.flow.MutableStateFlow(mutableListOf<NodeConfig>())
-    val proxyPort = kotlinx.coroutines.flow.MutableStateFlow("8080")
     val logMessages = kotlinx.coroutines.flow.MutableStateFlow(mutableListOf<String>())
     val errorMessage = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
     val connectionStatusText = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
@@ -63,6 +62,9 @@ class VpnViewModel : ViewModel() {
         private const val ATTEMPT_TIMEOUT_MS = 60_000L
         private const val DISCONNECT_MUTEX_TIMEOUT_MS = 70_000L
         private val BACKOFF_MS = longArrayOf(0, 1_000, 2_000)
+        // local proxy 监听端口（仅供 preConnect 预热用，TUN 模式下数据不走 local proxy）。
+        // 端口冲突时 startProxyWithRetries 会自动递增。
+        private const val LOCAL_PROXY_PORT = 8080
     }
 
     fun initSettings(context: android.content.Context) {
@@ -75,15 +77,13 @@ class VpnViewModel : ViewModel() {
         settingsManager?.let { manager ->
             val loadedNodes = manager.loadNodes()
             nodes.value = loadedNodes.toMutableList()
-            proxyPort.value = manager.loadProxyPort()
-            addLog("Settings loaded: ${loadedNodes.size} nodes, port ${proxyPort.value}")
+            addLog("Settings loaded: ${loadedNodes.size} nodes")
         }
     }
 
     private fun saveSettings() {
         settingsManager?.let { manager ->
             manager.saveNodes(nodes.value)
-            manager.saveProxyPort(proxyPort.value)
         }
     }
 
@@ -265,9 +265,6 @@ class VpnViewModel : ViewModel() {
             throw Exception("Failed to start proxy on ports $basePort..${basePort + 9}")
         }
         addLog("Proxy started on port $actualPort")
-        if (actualPort != basePort) {
-            proxyPort.value = actualPort.toString()
-        }
         return actualPort
     }
 
@@ -316,13 +313,13 @@ class VpnViewModel : ViewModel() {
                     throw Exception("VPN permission not granted. Please grant VPN permission first.")
                 }
 
-                val basePort = proxyPort.value.toInt()
+                val basePort = LOCAL_PROXY_PORT
                 var lastError: Exception? = null
 
                 // 重试循环：每次尝试整体超时 ATTEMPT_TIMEOUT_MS；超时/失败后全量释放资源再重试。
                 for (attempt in 1..MAX_CONNECT_ATTEMPTS) {
                     try {
-                        val actualPort = withTimeout(ATTEMPT_TIMEOUT_MS) {
+                        withTimeout(ATTEMPT_TIMEOUT_MS) {
                             // 注入系统 DNS 给 iroh，避免 iroh 在 Android 上 JNI 读系统 DNS
                             // 失败后回落 Google DNS（国内不稳定导致后端连不上）。
                             // 每次重试都重新获取，因为 releaseAllResources 后网络可能变化。
@@ -353,14 +350,12 @@ class VpnViewModel : ViewModel() {
                             } else {
                                 addLog("All pre-connect attempts failed, starting VPN anyway")
                             }
-                            port
                         }
 
                         // 成功：拉起 VPN 前台服务。
                         val allDomains = nodes.value.flatMap { it.domains }
                         val intent = Intent(context, NexaVpnService::class.java).apply {
                             action = NexaVpnService.ACTION_START
-                            putExtra(NexaVpnService.EXTRA_PROXY_PORT, actualPort)
                             putStringArrayListExtra(NexaVpnService.EXTRA_DOMAINS, ArrayList(allDomains))
                         }
                         context.startForegroundService(intent)
@@ -539,11 +534,6 @@ class VpnViewModel : ViewModel() {
                 saveSettings()
             }
         }
-    }
-
-    fun updateProxyPort(port: String) {
-        proxyPort.value = port
-        saveSettings()
     }
 
     fun clearLogs() {

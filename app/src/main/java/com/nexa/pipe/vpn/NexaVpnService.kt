@@ -35,7 +35,6 @@ class NexaVpnService : VpnService() {
     private val TAG = "NexaVpnService"
     private var vpnInterface: ParcelFileDescriptor? = null
     private var isRunning = false
-    private var proxyPort = 8080
     private var allowedDomains = mutableSetOf<String>()
 
     private var connectivityManager: ConnectivityManager? = null
@@ -75,8 +74,7 @@ class NexaVpnService : VpnService() {
         unregisterNetworkCallback()
     }
 
-    fun startVPN(proxyPort: Int, domains: Set<String>) {
-        this.proxyPort = proxyPort
+    fun startVPN(domains: Set<String>) {
         this.allowedDomains = domains.toMutableSet()
         isUserStarted = true
 
@@ -93,9 +91,8 @@ class NexaVpnService : VpnService() {
         if (intent != null) {
             when (intent.action) {
                 ACTION_START -> {
-                    val port = intent.getIntExtra(EXTRA_PROXY_PORT, 8080)
                     val domains = intent.getStringArrayListExtra(EXTRA_DOMAINS) ?: emptyList()
-                    startVPN(port, domains.toSet())
+                    startVPN(domains.toSet())
                 }
                 ACTION_STOP -> {
                     stopVPN()
@@ -167,12 +164,12 @@ class NexaVpnService : VpnService() {
                 val proxyDomainsStr = allowedDomains.joinToString(",")
                 val portalDomainsStr = captivePortalDomains.joinToString(",")
 
-                Log.d(TAG, "Starting TUN proxy: fd=$fd, proxyPort=$proxyPort, " +
+                Log.d(TAG, "Starting TUN proxy: fd=$fd, " +
                         "proxyDomains=${allowedDomains.size} items, " +
                         "portalDomains=${captivePortalDomains.size} items")
 
                 val result = IrohProxy.nativeStartTunProxy(
-                    fd, proxyPort, proxyDomainsStr, portalDomainsStr
+                    fd, proxyDomainsStr, portalDomainsStr
                 )
 
                 if (result != 0) {
@@ -284,7 +281,6 @@ class NexaVpnService : VpnService() {
         private const val CHANNEL_ID = "NexaVPN"
         const val ACTION_START = "com.nexa.pipe.vpn.ACTION_START"
         const val ACTION_STOP = "com.nexa.pipe.vpn.ACTION_STOP"
-        const val EXTRA_PROXY_PORT = "com.nexa.pipe.vpn.EXTRA_PROXY_PORT"
         const val EXTRA_DOMAINS = "com.nexa.pipe.vpn.EXTRA_DOMAINS"
     }
 }

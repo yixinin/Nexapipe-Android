@@ -41,7 +41,6 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val isIrohStarted by viewModel.isIrohStarted.collectAsState()
     val endpointId by viewModel.endpointId.collectAsState()
     val nodes by viewModel.nodes.collectAsState()
-    val proxyPort by viewModel.proxyPort.collectAsState()
     val logMessages by viewModel.logMessages.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
@@ -220,17 +219,6 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     }
 
                     Spacer(modifier = Modifier.height(16.dp))
-
-                    OutlinedTextField(
-                        value = proxyPort,
-                        onValueChange = { viewModel.updateProxyPort(it) },
-                        label = { Text("Local Proxy Port") },
-                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                        leadingIcon = { Icon(Icons.Default.Phone, contentDescription = null) },
-                        singleLine = true
-                    )
-
-                    HorizontalDivider(modifier = Modifier.padding(bottom = 16.dp))
 
                     Row(
                         verticalAlignment = Alignment.CenterVertically,

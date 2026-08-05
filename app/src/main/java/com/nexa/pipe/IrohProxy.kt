@@ -71,14 +71,12 @@ object IrohProxy {
      * Rust 侧 dup 两份（读/写）后关闭原始 fd。
      *
      * @param tunFd ParcelFileDescriptor.detachFd() 返回的原始 fd
-     * @param proxyPort 代理端口（保留参数，TUN 模式下不使用）
      * @param proxyDomains 逗号分隔的代理域名列表
      * @param captivePortalDomains 逗号分隔的 captive portal 校验域名列表
      * @return 0 成功，-1 失败
      */
     external fun nativeStartTunProxy(
         tunFd: Int,
-        proxyPort: Int,
         proxyDomains: String,
         captivePortalDomains: String
     ): Int
