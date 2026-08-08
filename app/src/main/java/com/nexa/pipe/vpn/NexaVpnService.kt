@@ -99,6 +99,22 @@ class NexaVpnService : VpnService() {
             return
         }
 
+        // ACTION_START 表示 VpnViewModel 要求重新建立 VPN（含新 TUN fd）。
+        // nativeStopProxy（connect 流程中 startProxyWithRetries 调用）已停掉了
+        // Rust 侧 TUN 代理，但 isRunning 可能仍为 true（VPN 服务未被 stopVPN 停止）。
+        // 必须重置 isRunning，否则 establishVPN 会因 "VPN already running" 跳过，
+        // 导致 TUN 代理永远不会重建 → 数据平面死掉（表现为 "连上就断"）。
+        synchronized(this@NexaVpnService) {
+            if (isRunning) {
+                Log.d(TAG, "startVPN: resetting isRunning (TUN proxy was stopped by nativeStopProxy)")
+                isRunning = false
+                tunProxyStarted = false
+            }
+        }
+        // 取消可能挂起的网络切换重连，避免与新的建立流程竞态。
+        reconnectJob?.cancel()
+        reconnectJob = null
+
         establishVPN()
     }
 
