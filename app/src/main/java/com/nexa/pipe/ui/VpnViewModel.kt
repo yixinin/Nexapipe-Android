@@ -23,10 +23,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import java.net.HttpURLConnection
 import java.net.InetAddress
-import java.net.InetSocketAddress
-import java.net.Proxy
 
 import kotlinx.serialization.Serializable
 
@@ -300,6 +297,17 @@ class VpnViewModel : ViewModel() {
                 addLog("connect: disconnect in progress, aborting")
                 return@launch
             }
+
+            // If the VPN is already believed to be running (stale state after
+            // activity recreation, or a repeated tap), tear the old tunnel down
+            // cleanly first. Otherwise nativeStopProxy stops the TUN proxy while
+            // the service skips ACTION_START ("VPN already running, skipping"),
+            // leaving a dead tunnel that looks like a disconnect after connecting.
+            if (isVpnRunning.value) {
+                addLog("connect: VPN already running, stopping it before reconnecting")
+                releaseAllResources(context)
+            }
+
             try {
                 isConnecting.value = true
                 errorMessage.value = null
@@ -336,19 +344,22 @@ class VpnViewModel : ViewModel() {
                             }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()
-                            val port = startProxyWithRetries(basePort)
+                            startProxyWithRetries(basePort)
 
-                            // Pre-connect：通过本地代理预热 iroh 连接。
-                            connectionStatusText.value = "Pre-connecting..."
-                            addLog("Pre-connecting to ${allDomains.size} domains...")
-                            val preConnectedCount = preConnectAll(allDomains, port)
-                            connectionStatusText.value = null
-                            addLog("Pre-connect completed: $preConnectedCount/${allDomains.size} domains succeeded")
+                            // Pre-connect: warm up iroh connections directly on the Rust side
+                            // and cache them in the shared connection pool. Unlike HTTP-based
+                            // warm-up through the local proxy, this does not depend on backends
+                            // answering plain HTTP requests, and it does not consume pooled
+                            // connections, so warm-up is reliable.
+                            // Pre-connect runs as part of the overall connecting flow;
+                            // the UI keeps showing "Connecting..." (no separate status).
+                            addLog("Pre-connecting to backends (native warm-up)...")
+                            val preConnectedCount = IrohProxy.nativePreconnect()
                             if (preConnectedCount > 0) {
-                                addLog("Pre-connect succeeded for at least one domain")
+                                addLog("Pre-connect completed: $preConnectedCount backend(s) warmed")
                                 delay(1000)
                             } else {
-                                addLog("All pre-connect attempts failed, starting VPN anyway")
+                                addLog("Pre-connect failed or no backend warmed ($preConnectedCount), starting VPN anyway")
                             }
                         }
 
@@ -387,67 +398,6 @@ class VpnViewModel : ViewModel() {
                 connectionStatusText.value = null
                 connectionMutex.unlock()
             }
-        }
-    }
-
-    /**
-     * Send a lightweight HTTP GET request through the local proxy to warm up the iroh
-     * connection. Returns true if the backend responded (even with an error code),
-     * false on timeout or network failure.
-     */
-    private suspend fun preConnect(domain: String, proxyPort: Int, maxRetries: Int = 1): Boolean {
-        for (attempt in 0 until maxRetries) {
-            val success = try {
-                withTimeout(6_000) {
-                    val proxy = Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", proxyPort))
-                    val url = java.net.URL("http://$domain/")
-                    val conn = url.openConnection(proxy) as HttpURLConnection
-                    conn.connectTimeout = 5_000
-                    conn.readTimeout = 5_000
-                    conn.requestMethod = "GET"
-                    conn.instanceFollowRedirects = false
-                    conn.responseCode
-                    true
-                }
-            } catch (e: Exception) {
-                if (attempt < maxRetries - 1) {
-                    Log.w(TAG, "Pre-connect to $domain attempt ${attempt + 1} failed: ${e.message}, retrying...")
-                    delay(500)
-                } else {
-                    Log.w(TAG, "Pre-connect to $domain failed after $maxRetries attempts: ${e.message}")
-                }
-                false
-            }
-            if (success) {
-                return true
-            }
-        }
-        return false
-    }
-
-    /**
-     * Pre-connect to all domains in parallel to warm up iroh connections.
-     * Returns the number of successfully pre-connected domains.
-     * 注意：connectionStatusText 由 connect() 统一设置，此处不再重复赋值。
-     */
-    private suspend fun preConnectAll(domains: List<String>, proxyPort: Int): Int {
-        addLog("Starting parallel pre-connect for ${domains.size} domains")
-
-        return kotlinx.coroutines.coroutineScope {
-            val deferredResults = domains.map { domain ->
-                async {
-                    addLog("Pre-connecting to $domain")
-                    val success = preConnect(domain, proxyPort)
-                    if (success) {
-                        addLog("Pre-connect to $domain succeeded")
-                    } else {
-                        addLog("Pre-connect to $domain failed")
-                    }
-                    success
-                }
-            }
-
-            deferredResults.awaitAll().count { it }
         }
     }
 

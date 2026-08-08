@@ -44,6 +44,16 @@ object IrohProxy {
     external fun nativeStartIroh(): String?
     
     external fun nativeStartProxy(listenPort: Int): Int
+
+    /**
+     * Pre-connect (warm-up): establish one iroh connection per configured
+     * backend and cache it in the shared connection pool, so the first real
+     * request after the VPN is up does not wait for the QUIC/relay handshake.
+     * The TUN proxy and the local proxy share the same EndpointGroup / pool.
+     * Must be called after nativeStartProxy and before the VPN is established.
+     * @return number of backends warmed, or -1 on failure.
+     */
+    external fun nativePreconnect(): Int
     
     external fun nativeStartProxyLegacy(listenPort: Int, targetEndpointId: String): Int
     
