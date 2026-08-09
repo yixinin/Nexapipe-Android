@@ -138,6 +138,7 @@ class NexaVpnService : VpnService() {
         isUserStarted = false
         tunProxyStarted = false
         networkLost = false
+        isServiceActive = false
         // 取消进行中的网络切换重连，避免与手动断开竞态。
         reconnectJob?.cancel()
         reconnectJob = null
@@ -230,6 +231,7 @@ class NexaVpnService : VpnService() {
             }
 
             tunProxyStarted = true
+            isServiceActive = true
             Log.d(TAG, "VPN + TUN proxy established successfully (routing 10.0.1.0/24)")
             createNotificationChannel()
             startForeground(1, createNotification())
@@ -441,5 +443,15 @@ class NexaVpnService : VpnService() {
         private const val MAX_RECONNECT_ATTEMPTS = 3
         private const val RECONNECT_ATTEMPT_TIMEOUT_MS = 60_000L
         private const val RECONNECT_BACKOFF_MS = 2_000L
+
+        /**
+         * 进程级标志：VPN 服务是否处于活动状态（TUN 代理已建立）。
+         * 用于 ViewModel 在 Activity 重建后同步 UI 状态，避免 UI 显示 "Disconnected"
+         * 但 VPN 服务实际仍在运行的不一致。
+         */
+        @Volatile
+        @JvmStatic
+        var isServiceActive: Boolean = false
+            private set
     }
 }

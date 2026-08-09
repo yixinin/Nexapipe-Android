@@ -51,6 +51,12 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     var showAddDomainDialogForNode by remember { mutableStateOf<String?>(null) }
     var nodeToDelete by remember { mutableStateOf<String?>(null) }
 
+    // 每次组合进入可见区域时同步 VPN 服务状态，
+    // 覆盖 Activity 重建以外的场景（如从其他页面导航返回）。
+    LaunchedEffect(Unit) {
+        viewModel.syncVpnServiceState()
+    }
+
     fun handleConnect(context: Context) {
         viewModel.checkVpnPermission(context)
         viewModel.checkNotificationPermission(context)

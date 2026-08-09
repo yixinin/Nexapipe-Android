@@ -490,4 +490,19 @@ class VpnViewModel : ViewModel() {
         logMessages.value.clear()
         logMessages.value = logMessages.value.toMutableList()
     }
+
+    /**
+     * 将 ViewModel 的 isVpnRunning 与 NexaVpnService 的实际状态同步。
+     *
+     * 场景：Activity/ViewModel 被重建（进程部分恢复、开发者选项等）后，
+     * isVpnRunning 默认为 false，但 VPN 服务可能仍在前台运行。
+     * 调用此方法可将 UI 状态与实际服务状态对齐，避免显示 "Disconnected"
+     * 而实际隧道仍可用的不一致。
+     */
+    fun syncVpnServiceState() {
+        if (!isVpnRunning.value && !isConnecting.value && NexaVpnService.isServiceActive) {
+            isVpnRunning.value = true
+            addLog("Synced UI state: VPN service is active")
+        }
+    }
 }
