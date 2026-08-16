@@ -13,7 +13,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -26,6 +28,7 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.PermissionManager
@@ -44,12 +47,22 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val logMessages by viewModel.logMessages.collectAsState()
     val errorMessage by viewModel.errorMessage.collectAsState()
     val connectionStatusText by viewModel.connectionStatusText.collectAsState()
+    val relayMode by viewModel.relayMode.collectAsState()
+    val relayUrl by viewModel.relayUrl.collectAsState()
+    val forceRelay by viewModel.forceRelay.collectAsState()
+    val twoFactorEnabled by viewModel.twoFactorEnabled.collectAsState()
+    val twoFactorClientId by viewModel.twoFactorClientId.collectAsState()
+    val twoFactorSecret by viewModel.twoFactorSecret.collectAsState()
+    val twoFactorAlgorithm by viewModel.twoFactorAlgorithm.collectAsState()
 
     var showLogs by remember { mutableStateOf(false) }
     var showPermissionGuide by remember { mutableStateOf(false) }
     var showAddNodeDialog by remember { mutableStateOf(false) }
     var showAddDomainDialogForNode by remember { mutableStateOf<String?>(null) }
     var nodeToDelete by remember { mutableStateOf<String?>(null) }
+    var showRelaySettings by remember { mutableStateOf(false) }
+    var showTwoFactorSettings by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(true) }
 
     // 每次组合进入可见区域时同步 VPN 服务状态，
     // 覆盖 Activity 重建以外的场景（如从其他页面导航返回）。
@@ -121,6 +134,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(paddingValues)
                 .padding(horizontal = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -221,10 +235,19 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     ) {
                         Icon(Icons.Default.Settings, contentDescription = null)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Settings", style = MaterialTheme.typography.titleMedium)
+                        Text("Configurations", style = MaterialTheme.typography.titleMedium)
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(onClick = { showSettings = !showSettings }) {
+                            Icon(
+                                if (showSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Toggle"
+                            )
+                        }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    AnimatedVisibility(visible = showSettings) {
+                        Column {
+                            Spacer(modifier = Modifier.height(16.dp))
 
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -358,6 +381,215 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                     }
                                 }
                             }
+                        }
+                    }
+                    }
+                    }
+                }
+            }
+
+            // Relay Settings Card
+            Spacer(modifier = Modifier.height(16.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Relay Settings", style = MaterialTheme.typography.titleSmall)
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(onClick = { showRelaySettings = !showRelaySettings }) {
+                            Icon(
+                                if (showRelaySettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Toggle"
+                            )
+                        }
+                    }
+
+                    AnimatedVisibility(visible = showRelaySettings) {
+                        Column {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text("Relay Mode", style = MaterialTheme.typography.labelMedium)
+                            Spacer(modifier = Modifier.height(4.dp))
+
+                            val relayModes = listOf(
+                                "pinned" to "Pinned (aps1-1, stable)",
+                                "default" to "Default (all N0 relays)",
+                                "disabled" to "Disabled (direct only)",
+                                "custom" to "Custom URL"
+                            )
+                            relayModes.forEach { (mode, label) ->
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 2.dp)
+                                ) {
+                                    RadioButton(
+                                        selected = relayMode == mode,
+                                        onClick = {
+                                            viewModel.updateRelayConfig(mode, relayUrl, forceRelay)
+                                        }
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(label, style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+
+                            if (relayMode == "custom") {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = relayUrl,
+                                    onValueChange = { newUrl ->
+                                        viewModel.updateRelayConfig(relayMode, newUrl, forceRelay)
+                                    },
+                                    label = { Text("Relay URL") },
+                                    placeholder = { Text("https://relay.example.com") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Force Relay", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                                Switch(
+                                    checked = forceRelay,
+                                    onCheckedChange = { newForce ->
+                                        viewModel.updateRelayConfig(relayMode, relayUrl, newForce)
+                                    }
+                                )
+                            }
+                            Text(
+                                "When enabled, connections are always routed through relay servers.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 2FA Settings Card
+            Spacer(modifier = Modifier.height(16.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Lock, contentDescription = null)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("2FA Settings", style = MaterialTheme.typography.titleSmall)
+                        Spacer(modifier = Modifier.weight(1f))
+                        IconButton(onClick = { showTwoFactorSettings = !showTwoFactorSettings }) {
+                            Icon(
+                                if (showTwoFactorSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                                contentDescription = "Toggle"
+                            )
+                        }
+                    }
+
+                    AnimatedVisibility(visible = showTwoFactorSettings) {
+                        Column {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text("Enable 2FA", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                                Switch(
+                                    checked = twoFactorEnabled,
+                                    onCheckedChange = { enabled ->
+                                        viewModel.updateTwoFactorConfig(
+                                            enabled,
+                                            twoFactorClientId,
+                                            twoFactorSecret,
+                                            twoFactorAlgorithm
+                                        )
+                                    }
+                                )
+                            }
+
+                            if (twoFactorEnabled) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = twoFactorClientId,
+                                    onValueChange = { newId ->
+                                        viewModel.updateTwoFactorConfig(
+                                            twoFactorEnabled,
+                                            newId,
+                                            twoFactorSecret,
+                                            twoFactorAlgorithm
+                                        )
+                                    },
+                                    label = { Text("Client ID") },
+                                    placeholder = { Text("client-001") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true
+                                )
+
+                                Spacer(modifier = Modifier.height(8.dp))
+                                OutlinedTextField(
+                                    value = twoFactorSecret,
+                                    onValueChange = { newSecret ->
+                                        viewModel.updateTwoFactorConfig(
+                                            twoFactorEnabled,
+                                            twoFactorClientId,
+                                            newSecret,
+                                            twoFactorAlgorithm
+                                        )
+                                    },
+                                    label = { Text("TOTP Secret") },
+                                    placeholder = { Text("JBSWY3DPEHPK3PXP") },
+                                    visualTransformation = PasswordVisualTransformation(),
+                                    modifier = Modifier.fillMaxWidth(),
+                                    singleLine = true
+                                )
+
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text("Algorithm", style = MaterialTheme.typography.labelMedium)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                listOf("sha1" to "SHA1 (default)", "sha256" to "SHA256", "sha512" to "SHA512")
+                                    .forEach { (alg, label) ->
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 2.dp)
+                                        ) {
+                                            RadioButton(
+                                                selected = twoFactorAlgorithm == alg,
+                                                onClick = {
+                                                    viewModel.updateTwoFactorConfig(
+                                                        twoFactorEnabled,
+                                                        twoFactorClientId,
+                                                        twoFactorSecret,
+                                                        alg
+                                                    )
+                                                }
+                                            )
+                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Text(label, style = MaterialTheme.typography.bodySmall)
+                                        }
+                                    }
+                            }
+                            Text(
+                                "2FA authenticates each connection with the server using a TOTP code.",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                 }

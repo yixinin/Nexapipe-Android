@@ -61,21 +61,12 @@ class NexaVpnService : VpnService() {
     // TUN 子网配置（必须与 Rust tun_proxy.rs 的虚拟 IP 常量一致）
     private val virtualDNSIP = "10.0.1.2"
     private val tunInterfaceIP = "10.0.1.1"
-    // virtualProxyIP(10.0.1.3) 和 virtualCaptivePortalIP(10.0.1.4) 在 Rust 侧硬编码，
-    // 这里不需要——DNS 响应由 Rust 构造，TCP 分流由 Rust 按 local_addr.ip() 判断。
-
-    // Android/MIUI 联网校验域名。运营商 DNS 常劫持这些域名到 captive portal IP，
-    // 导致系统判定无网络/感叹号。Rust 侧将它们 DNS 劫到 10.0.1.4，TCP 直接回 204。
-    private val captivePortalDomains = setOf(
-        "connectivitycheck.gstatic.com",
-        "connectivitycheck.android.com",
-        "connectivitycheck.google.com",
-        "connect.rom.miui.com",
-        "connect.rom.miui.jp",
-        "connect.vip.miui.com",
-        "wifi.vip.miui.com",
-        "www.google.com"
-    )
+    // virtualProxyIP(10.0.1.3) 在 Rust 侧硬编码，这里不需要——DNS 响应由 Rust 构造，
+    // TCP 分流由 Rust 按 local_addr.ip() 判断。
+    //
+    // 注意：不要劫持系统 captive portal 校验域名（connectivitycheck.gstatic.com 等）到
+    // 私有 IP。Android 的 NetworkMonitor 会把"校验域名解析到私有 IP"判定为无互联网，
+    // 导致状态栏 WiFi 感叹号。让它们走真实 DNS、连物理网络即可。
 
     override fun onCreate() {
         super.onCreate()
@@ -210,14 +201,12 @@ class NexaVpnService : VpnService() {
             vpnInterface = null  // PFD 已失效，清除引用
 
             val proxyDomainsStr = allowedDomains.joinToString(",")
-            val portalDomainsStr = captivePortalDomains.joinToString(",")
 
             Log.d(TAG, "Starting TUN proxy: fd=$fd, " +
-                    "proxyDomains=${allowedDomains.size} items, " +
-                    "portalDomains=${captivePortalDomains.size} items")
+                    "proxyDomains=${allowedDomains.size} items")
 
             val result = IrohProxy.nativeStartTunProxy(
-                fd, proxyDomainsStr, portalDomainsStr
+                fd, proxyDomainsStr
             )
 
             if (result != 0) {

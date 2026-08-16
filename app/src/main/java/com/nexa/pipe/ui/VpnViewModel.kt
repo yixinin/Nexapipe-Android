@@ -48,6 +48,17 @@ class VpnViewModel : ViewModel() {
     val vpnPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
     val notificationPermissionGranted = kotlinx.coroutines.flow.MutableStateFlow(false)
 
+    // Relay configuration
+    val relayMode = kotlinx.coroutines.flow.MutableStateFlow("pinned") // "pinned", "default", "disabled", "custom"
+    val relayUrl = kotlinx.coroutines.flow.MutableStateFlow("")
+    val forceRelay = kotlinx.coroutines.flow.MutableStateFlow(false)
+
+    // 2FA configuration
+    val twoFactorEnabled = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val twoFactorClientId = kotlinx.coroutines.flow.MutableStateFlow("")
+    val twoFactorSecret = kotlinx.coroutines.flow.MutableStateFlow("")
+    val twoFactorAlgorithm = kotlinx.coroutines.flow.MutableStateFlow("sha1") // "sha1", "sha256", "sha512"
+
     // 串行化 connect/disconnect，避免并发 native 调用竞态。
     private val connectionMutex = Mutex()
     // 持有 connect 协程句柄，disconnect 时可取消（JNI 不可中断，但下一挂起点会抛 CancellationException）。
@@ -74,14 +85,45 @@ class VpnViewModel : ViewModel() {
         settingsManager?.let { manager ->
             val loadedNodes = manager.loadNodes()
             nodes.value = loadedNodes.toMutableList()
-            addLog("Settings loaded: ${loadedNodes.size} nodes")
+            relayMode.value = manager.loadRelayMode()
+            relayUrl.value = manager.loadRelayUrl()
+            forceRelay.value = manager.loadForceRelay()
+            twoFactorEnabled.value = manager.loadTwoFactorEnabled()
+            twoFactorClientId.value = manager.loadTwoFactorClientId()
+            twoFactorSecret.value = manager.loadTwoFactorSecret()
+            twoFactorAlgorithm.value = manager.loadTwoFactorAlgorithm()
+            addLog("Settings loaded: ${loadedNodes.size} nodes, relay=${relayMode.value}")
         }
     }
 
     private fun saveSettings() {
         settingsManager?.let { manager ->
             manager.saveNodes(nodes.value)
+            manager.saveRelayConfig(relayMode.value, relayUrl.value, forceRelay.value)
+            manager.saveTwoFactorConfig(
+                twoFactorEnabled.value,
+                twoFactorClientId.value,
+                twoFactorSecret.value,
+                twoFactorAlgorithm.value
+            )
         }
+    }
+
+    fun updateRelayConfig(mode: String, url: String, force: Boolean) {
+        relayMode.value = mode
+        relayUrl.value = url
+        forceRelay.value = force
+        saveSettings()
+        addLog("Relay config updated: mode=${mode}, force=${force}")
+    }
+
+    fun updateTwoFactorConfig(enabled: Boolean, clientId: String, secret: String, algorithm: String) {
+        twoFactorEnabled.value = enabled
+        twoFactorClientId.value = clientId
+        twoFactorSecret.value = secret
+        twoFactorAlgorithm.value = algorithm
+        saveSettings()
+        addLog("2FA config updated: enabled=${enabled}, client=${clientId}, algorithm=${algorithm}")
     }
 
     fun addLog(message: String) {
@@ -341,6 +383,16 @@ class VpnViewModel : ViewModel() {
                             val dnsOverrides = resolveIrohDnsOverrides()
                             if (dnsOverrides.isNotEmpty()) {
                                 IrohProxy.nativeSetDnsOverride(dnsOverrides)
+                            }
+                            // 配置 relay 模式
+                            IrohProxy.nativeSetRelayConfig(relayMode.value, relayUrl.value)
+                            // 配置 2FA 凭证（必须在 nativeStartProxy 之前注入）
+                            if (twoFactorEnabled.value) {
+                                IrohProxy.nativeSetTwoFactor(
+                                    twoFactorClientId.value,
+                                    twoFactorSecret.value,
+                                    twoFactorAlgorithm.value
+                                )
                             }
                             ensureIrohStarted()
                             val allDomains = addDomainMappings()

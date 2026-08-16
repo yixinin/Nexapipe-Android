@@ -40,6 +40,21 @@ object IrohProxy {
      * nativeStartIroh 用它构造 OverrideResolver，对这些域名直接返回预解析 IP。
      */
     external fun nativeSetDnsOverride(overrides: String): Int
+    /**
+     * 配置 relay 模式和自定义 URL。
+     * relay_mode: "default"（使用默认 N0 relay）、"disabled"（禁用 relay，仅直连）、"custom"（使用自定义 URL）。
+     * relay_url: 仅在 relay_mode="custom" 时使用，需为完整的 relay URL。
+     * 必须在 nativeStartIroh 之前调用。
+     */
+    external fun nativeSetRelayConfig(relayMode: String, relayUrl: String): Int
+    /**
+     * 配置客户端 2FA 凭证。
+     * clientId: 与服务器 [auth.clients] 中配置的 ID 一致。
+     * secret: Base32 编码的 TOTP 密钥（nexapipe --generate-2fa 生成）。
+     * algorithm: "sha1" / "sha256" / "sha512"。
+     * 必须在 nativeStartProxy / nativeStartProxyLegacy 之前调用。
+     */
+    external fun nativeSetTwoFactor(clientId: String, secret: String, algorithm: String): Int
 
     external fun nativeStartIroh(): String?
     
@@ -82,13 +97,11 @@ object IrohProxy {
      *
      * @param tunFd ParcelFileDescriptor.detachFd() 返回的原始 fd
      * @param proxyDomains 逗号分隔的代理域名列表
-     * @param captivePortalDomains 逗号分隔的 captive portal 校验域名列表
      * @return 0 成功，-1 失败
      */
     external fun nativeStartTunProxy(
         tunFd: Int,
-        proxyDomains: String,
-        captivePortalDomains: String
+        proxyDomains: String
     ): Int
 
     /**
